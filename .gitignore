@@ -83,3 +83,7 @@ GTAGS
 # Python building things where it shouldn't
 /src/python-common/build/
 .cache
+
+ceph-build-deps_*
+install-deps-*/
+monitoring/ceph-mixin/wheelhouse-wip/

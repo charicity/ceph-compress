@@ -1,0 +1,9 @@
+cmake \
+  -GNinja \
+  -DWITH_PYTHON3=3 \
+  -DCMAKE_C_COMPILER=clang \
+  -DBOOST_J=32 \
+  -DWITH_CCACHE=ON \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+  -DCMAKE_INSTALL_PREFIX=$HOME/ceph-default \
+  ..
