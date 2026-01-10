@@ -45,5 +45,10 @@ if(HAVE_BROTLI)
   list(APPEND ceph_compressor_libs ceph_brotli)
 endif()
 
+if(HAVE_HRAC)
+  add_subdirectory(hrac)
+  list(APPEND ceph_compressor_libs ceph_hrac)
+endif()
+
 add_custom_target(compressor_plugins DEPENDS
     ${ceph_compressor_libs})

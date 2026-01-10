@@ -1,0 +1,16 @@
+{
+  "cmake.configureArgs": [
+    "-GNinja",
+    "-DWITH_PYTHON3=3",
+    "-DCMAKE_C_COMPILER=clang",
+    "-DBOOST_J=32",
+    "-DWITH_CCACHE=ON",
+    "-DWITH_LZ4=ON",
+    "-DWITH_HRAC=ON",
+    "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+    "-DCMAKE_INSTALL_PREFIX=$HOME/ceph-default",
+    "-DCMAKE_CXX_COMPILER=clang++",
+  ],
+  "cmake.buildDirectory": "${workspaceFolder}/build",
+  "cmake.generator": "Ninja"
+}

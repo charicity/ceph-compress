@@ -4460,6 +4460,7 @@ options:
   - zlib
   - zstd
   - lz4
+  - hrac
   flags:
   - runtime
   with_legacy: true

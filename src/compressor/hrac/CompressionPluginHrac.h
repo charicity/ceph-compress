@@ -1,9 +1,9 @@
 /*
  * Ceph - scalable distributed file system
  *
- * Copyright (C) 2015 Mirantis, Inc.
+ * Copyright (C) 2017 XSKY Inc.
  *
- * Author: Alyona Kiseleva <akiselyova@mirantis.com>
+ * Author: Haomai Wang <haomaiwang@gmail.com>
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public
@@ -12,23 +12,23 @@
  *
  */
 
-#ifndef CEPH_COMPRESSION_PLUGIN_ZSTD_H
-#define CEPH_COMPRESSION_PLUGIN_ZSTD_H
+#ifndef CEPH_COMPRESSION_PLUGIN_HRAC_H
+#define CEPH_COMPRESSION_PLUGIN_HRAC_H
 
 // -----------------------------------------------------------------------------
-#include "ZstdCompressor.h"
+#include "HracCompressor.h"
 #include "ceph_ver.h"
 #include "compressor/CompressionPlugin.h"
 // -----------------------------------------------------------------------------
 
-class CompressionPluginZstd : public ceph::CompressionPlugin {
+class CompressionPluginHrac : public ceph::CompressionPlugin {
 
 public:
-  explicit CompressionPluginZstd(CephContext *cct) : CompressionPlugin(cct) {}
+  explicit CompressionPluginHrac(CephContext *cct) : CompressionPlugin(cct) {}
 
   int factory(CompressorRef *cs, std::ostream *ss) override {
     if (compressor == 0) {
-      ZstdCompressor *interface = new ZstdCompressor(cct);
+      HracCompressor *interface = new HracCompressor(cct);
       compressor = CompressorRef(interface);
     }
     *cs = compressor;
