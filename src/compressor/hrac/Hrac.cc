@@ -1,7 +1,11 @@
 #include "Hrac.h"
+#include "common/dout.h"
 #include <cstdio>
 #include <cstring>
 #include <immintrin.h>
+
+#define dout_subsys ceph_subsys_compressor
+#define dout_prefix *_dout << "hrac: "
 
 static const uint32_t nonzero_count_u8[256] = {
     0, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5,
@@ -2107,16 +2111,28 @@ fits_kcomp_u8(const dtype in[],    /* input array */
               const uint32_t inner /* the stride along this dimension */
 ) {
   uint32_t bigBlock = nsblk * inner;
+  ldout(g_ceph_context, 0) << "HRAC_DEBUG: fits_kcomp_u8() called with iLen="
+                           << iLen << ", oLen=" << oLen << ", blk=" << blk
+                           << ", nsblk=" << nsblk << ", inner=" << inner
+                           << dendl;
   if (!bigBlock || iLen % bigBlock) {
-    printf("error: dimensions don't match.\n");
+    ldout(g_ceph_context, 0)
+        << "HRAC_ERROR: fits_kcomp_u8() dimension mismatch: iLen=" << iLen
+        << ", bigBlock=" << bigBlock << dendl;
+    // printf("error: dimensions don't match.\n");
     return 0;
   }
   if (blk < 16) {
-    printf("error: blk should >= 16.\n");
+    ldout(g_ceph_context, 0)
+        << "HRAC_ERROR: fits_kcomp_u8() blk too small: blk=" << blk << dendl;
+    // printf("error: blk should >= 16.\n");
     return 0;
   }
   if (nsblk < blk) {
-    printf("error: nsblk should >= blk.\n");
+    ldout(g_ceph_context, 0)
+        << "HRAC_ERROR: fits_kcomp_u8() nsblk too small: nsblk=" << nsblk
+        << ", blk=" << blk << dendl;
+    // printf("error: nsblk should >= blk.\n");
     return 0;
   }
   if (iLen > (1u << 31)) {
@@ -2138,7 +2154,9 @@ fits_kcomp_u8(const dtype in[],    /* input array */
   uint32_t *li = (uint32_t *)aligned_alloc(64, sizeof(uint32_t) * lft);
 
   if (!bkt || !rw || !ci || !li) {
-    printf("error: aligned_alloc failed.\n");
+    ldout(g_ceph_context, 0)
+        << "HRAC_ERROR: fits_kcomp_u8() aligned_alloc failed." << dendl;
+    // printf("error: aligned_alloc failed.\n");
     return 0;
   }
 
@@ -2332,6 +2350,10 @@ fits_kcomp_u8(const dtype in[],    /* input array */
   free(rw);
   free(ci);
   free(li);
+
+  ldout(g_ceph_context, 0)
+      << "HRAC_DEBUG: fits_kcomp_u8() completed, input size=" << iLen
+      << ", output size=" << (uint8_t *)ocur - out << dendl;
   return (uint8_t *)ocur - out;
 }
 #undef BW

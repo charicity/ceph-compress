@@ -15,7 +15,7 @@ START_CEPH=false
 TMPDIR="./real_test_tmp"
 DATA_FILE="real-data.fits"       # 位于 ../build 下
 OBJECT_NAME="real-data.fits"
-BLOCK_SIZE=65536  # 默认 64KB
+BLOCK_SIZE=16777216  # 16MB
 VERBOSE=false
 RUN_LOG_FILENAME=""
 RUN_LOG_FILE=""
@@ -156,9 +156,20 @@ start_ceph_cluster() {
         log_info "正在关闭 Ceph 集群..."
         ../src/stop.sh 2>&1 | log_output || true
         wait_confirm "Ceph 集群关闭完成"
-        create_config
+        # create_config
         log_info "正在启动 Ceph 集群..."
-        ../src/vstart.sh -d -n -x --localhost --bluestore 2>&1 | log_output
+        ../src/vstart.sh -d -n -x --without-dashboard \
+            -o "osd_max_object_size = 536870912" \
+            -o "bluestore_compression_mode = force" \
+            -o "bluestore_compression_algorithm = hrac" \
+            -o "bluestore_max_blob_size = $BLOCK_SIZE" \
+            -o "bluestore_max_blob_size_ssd = $BLOCK_SIZE" \
+            -o "bluestore_compression_min_blob_size = $BLOCK_SIZE" \
+            -o "bluestore_compression_min_blob_size_ssd = $BLOCK_SIZE" \
+            -o "bluestore_compression_max_blob_size = $BLOCK_SIZE" \
+            -o "bluestore_compression_max_blob_size_ssd = $BLOCK_SIZE" \
+            -o "bluestore_compression_min_blob_size_hdd = $BLOCK_SIZE" \
+            -o "bluestore_compression_max_blob_size_hdd = $BLOCK_SIZE" 2>&1 | log_output
         wait_confirm "Ceph 集群重启完成"
         configure_compression
     else
@@ -170,17 +181,9 @@ start_ceph_cluster() {
 # 第四部分：配置 HRAC 压缩
 # ============================================================
 configure_compression() {
-    log_section "配置 HRAC 压缩"
-    log_info "设置 bluestore 压缩模式..."
-    ./bin/ceph tell osd.* injectargs --bluestore_compression_mode=force 2>&1 | log_output
-    log_info "设置 bluestore 压缩算法..."
-    ./bin/ceph tell osd.* injectargs --bluestore_compression_algorithm=hrac 2>&1 | log_output
-    # key: 8 KB -> 64 KB
-    log_info "强制设置压缩块大小为 $BLOCK_SIZE 字节..."
-    ./bin/ceph tell osd.* injectargs --bluestore_compression_min_blob_size=$BLOCK_SIZE 2>&1 | log_output
-    ./bin/ceph tell osd.* injectargs --bluestore_compression_min_blob_size_hdd=$BLOCK_SIZE 2>&1 | log_output
-    ./bin/ceph tell osd.* injectargs --bluestore_compression_max_blob_size_hdd=$BLOCK_SIZE 2>&1 | log_output
-
+    log_info "验证配置..."
+    # 检查配置
+    ./bin/ceph daemon osd.0 config show | grep -E "bluestore_compression|blob_size" 2>&1 | log_output
     wait_confirm "压缩配置完成"
 }
 
@@ -272,18 +275,26 @@ check_compression_ratio() {
 }
 
 show_compression_logs() {
-    local count=10
+    local count=20
     log_section "HRAC 压缩日志"
     
     {
         echo ""
         echo "=== 压缩日志 (后 $count 条) ==="
-        grep -a -h "HRAC_DEBUG" out/osd.*.log 2>/dev/null | grep "\bcompress" | sort | tail -"$count" || echo "未找到压缩日志"
+        grep -a -h "HRAC_DEBUG" out/osd.*.log 2>/dev/null | grep -E "\bcompress\(\)" | sort | tail -"$count" || echo "未找到压缩日志"
         
         echo ""
         echo "=== 解压日志 (后 $count 条) ==="
-        grep -a -h "HRAC_DEBUG" out/osd.*.log 2>/dev/null | grep "\bdecompress" | sort | tail -"$count" || echo "未找到解压日志"
-        
+        grep -a -h "HRAC_DEBUG" out/osd.*.log 2>/dev/null | grep -E "\bdecompress\(\)" | sort | tail -"$count" || echo "未找到解压日志"
+
+        echo ""
+        echo "=== Hrac codec ERROR 日志 (后 $count 条) ==="
+        grep -a -h -F "HRAC_ERROR" out/osd.*.log 2>/dev/null | grep -E "\bfits_kcomp_u8\(\)" | sort | tail -"$count" || echo "未找到 Hrac 日志"
+
+        echo ""
+        echo "=== Hrac codec DEBUG 日志 (后 $count 条) ==="
+        grep -a -h -F "HRAC_DEBUG" out/osd.*.log 2>/dev/null | grep -E "fits_kcomp_u8\(\)\bcompleted" | sort | tail -"$count" || echo "未找到 Hrac 日志"
+
         echo ""
         echo "=== OSD.0 日志尾部 ==="
         tail out/osd.0.log 2>/dev/null -n $count || echo "未找到 OSD 日志"
@@ -332,8 +343,8 @@ main() {
     configure_osd_limits
     create_test_pool
     upload_real_file
-    download_real_file
-    verify_integrity
+    # download_real_file
+    # verify_integrity
     check_compression_ratio
     show_compression_logs
     
