@@ -21,7 +21,7 @@
 const uint32_t HRAC_BLK = 64;
 const uint32_t HRAC_NSBLK = 1024;
 // const uint32_t HRAC_INNER = 1;
-const uint32_t HRAC_INNER = 4096;
+const uint32_t HRAC_INNER = 16384;
 
 #define dtype uint8_t
 #define diff_e diff_e8
@@ -81,7 +81,7 @@ public:
     dst.append(out_ptr, 0, compressed_len);
 
     ldout(cct, 0) << "HRAC_DEBUG: compress() Compression done. Compressed len="
-                  << compressed_len << dendl;
+                  << compressed_len << ", origin_len=" << origin_len << dendl;
     return 0;
   }
 

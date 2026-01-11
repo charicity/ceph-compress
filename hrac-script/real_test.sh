@@ -158,7 +158,7 @@ start_ceph_cluster() {
         wait_confirm "Ceph 集群关闭完成"
         # create_config
         log_info "正在启动 Ceph 集群..."
-        ../src/vstart.sh -d -n -x --without-dashboard \
+        MON=1 OSD=1 MDS=0 MGR=1 ../src/vstart.sh -d -n -x --without-dashboard \
             -o "osd_max_object_size = 536870912" \
             -o "bluestore_compression_mode = force" \
             -o "bluestore_compression_algorithm = hrac" \
@@ -169,6 +169,7 @@ start_ceph_cluster() {
             -o "bluestore_compression_max_blob_size = $BLOCK_SIZE" \
             -o "bluestore_compression_max_blob_size_ssd = $BLOCK_SIZE" \
             -o "bluestore_compression_min_blob_size_hdd = $BLOCK_SIZE" \
+            -o "bluestore_max_blob_size_hdd = $BLOCK_SIZE" \
             -o "bluestore_compression_max_blob_size_hdd = $BLOCK_SIZE" 2>&1 | log_output
         wait_confirm "Ceph 集群重启完成"
         configure_compression
@@ -224,7 +225,7 @@ upload_real_file() {
     if [ -f "$DATA_FILE" ]; then
         log_section "上传文件到 testpool"
         log_info "上传: $OBJECT_NAME <- $DATA_FILE"
-        ./bin/rados -p testpool put "$OBJECT_NAME" "$DATA_FILE" 2>&1 | log_output
+        ./bin/rados -p testpool -b "$BLOCK_SIZE" put "$OBJECT_NAME" "$DATA_FILE" 2>&1 | log_output
         log_info "上传完成"
         wait_confirm "文件上传完成"
     else
@@ -236,7 +237,7 @@ upload_real_file() {
 download_real_file() {
     log_section "从 testpool 下载文件"
     log_info "下载: $OBJECT_NAME -> $TMPDIR/retrieved_$OBJECT_NAME"
-    ./bin/rados -p testpool get "$OBJECT_NAME" "$TMPDIR/retrieved_$OBJECT_NAME" 2>&1 | log_output
+    ./bin/rados -p testpool -b "$BLOCK_SIZE" get "$OBJECT_NAME" "$TMPDIR/retrieved_$OBJECT_NAME" 2>&1 | log_output
     log_info "下载完成"
     wait_confirm "文件下载完成"
 }
