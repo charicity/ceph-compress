@@ -13,13 +13,14 @@ set -e
 # ============================================================
 START_CEPH=false
 TMPDIR="./real_test_tmp"
-DATA_FILE="real-data.fits"       # 位于 ../build 下
+DATA_FILE="../hrac-script/data/real-data.fits" 
 OBJECT_NAME="real-data.fits"
 BLOCK_SIZE=16777216  # 16MB
 VERBOSE=false
 SIMPLE_CLUSTER=false
 RUN_LOG_FILENAME=""
 RUN_LOG_FILE=""
+START_CONFIGS=""
 
 # ============================================================
 # 第一部分：参数解析函数
@@ -62,6 +63,15 @@ parse_args() {
                 ;;
         esac
     done
+
+    START_CONFIGS=(
+            -o "osd_max_object_size = 536870912"
+            -o "bluestore_compression_algorithm = hrac"
+            -o "bluestore_compression_mode = force"
+            -o "bluestore_max_blob_size = $BLOCK_SIZE"
+            -o "bluestore_compression_min_blob_size = $BLOCK_SIZE"
+            -o "bluestore_compression_max_blob_size = $BLOCK_SIZE"
+        )
 }
 
 show_help() {
@@ -76,6 +86,7 @@ show_help() {
     echo "  -h, --help          显示帮助信息"
     echo "  -b, --block         设置压缩块大小（默认 64KB，单位字节）"
     echo "  -v, --verbose       实时显示输出到终端（默认关闭）"
+    echo "  --simple-cluster    设置使用简易集群启动（默认关闭）"
     echo ""
     echo "示例:"
     echo "  $0                          # 使用默认配置"
@@ -161,38 +172,18 @@ start_ceph_cluster() {
         log_info "正在关闭 Ceph 集群..."
         ../src/stop.sh 2>&1 | log_output || true
         wait_confirm "Ceph 集群关闭完成"
-        # create_config
+        
+        # 定义配置数组
+
         log_info "正在启动 Ceph 集群..."
         if [ "$SIMPLE_CLUSTER" = true ]; then
             log_info "使用简单集群配置"
             MON=1 OSD=1 MDS=0 MGR=1 ../src/vstart.sh -d -n -x --without-dashboard \
-            -o "osd_max_object_size = 536870912" \
-            -o "bluestore_compression_mode = force" \
-            -o "bluestore_compression_algorithm = hrac" \
-            -o "bluestore_max_blob_size = $BLOCK_SIZE" \
-            -o "bluestore_max_blob_size_ssd = $BLOCK_SIZE" \
-            -o "bluestore_compression_min_blob_size = $BLOCK_SIZE" \
-            -o "bluestore_compression_min_blob_size_ssd = $BLOCK_SIZE" \
-            -o "bluestore_compression_max_blob_size = $BLOCK_SIZE" \
-            -o "bluestore_compression_max_blob_size_ssd = $BLOCK_SIZE" \
-            -o "bluestore_compression_min_blob_size_hdd = $BLOCK_SIZE" \
-            -o "bluestore_max_blob_size_hdd = $BLOCK_SIZE" \
-            -o "bluestore_compression_max_blob_size_hdd = $BLOCK_SIZE" 2>&1 | log_output
+            "${START_CONFIGS[@]}" 2>&1 | log_output
         else
             log_info "使用默认集群配置"
             ../src/vstart.sh -d -n -x --without-dashboard \
-            -o "osd_max_object_size = 536870912" \
-            -o "bluestore_compression_mode = force" \
-            -o "bluestore_compression_algorithm = hrac" \
-            -o "bluestore_max_blob_size = $BLOCK_SIZE" \
-            -o "bluestore_max_blob_size_ssd = $BLOCK_SIZE" \
-            -o "bluestore_compression_min_blob_size = $BLOCK_SIZE" \
-            -o "bluestore_compression_min_blob_size_ssd = $BLOCK_SIZE" \
-            -o "bluestore_compression_max_blob_size = $BLOCK_SIZE" \
-            -o "bluestore_compression_max_blob_size_ssd = $BLOCK_SIZE" \
-            -o "bluestore_compression_min_blob_size_hdd = $BLOCK_SIZE" \
-            -o "bluestore_max_blob_size_hdd = $BLOCK_SIZE" \
-            -o "bluestore_compression_max_blob_size_hdd = $BLOCK_SIZE" 2>&1 | log_output
+            "${START_CONFIGS[@]}" 2>&1 | log_output
         fi
         wait_confirm "Ceph 集群重启完成"
         configure_compression
@@ -209,13 +200,6 @@ configure_compression() {
     # 检查配置
     ./bin/ceph daemon osd.0 config show | grep -E "bluestore_compression|blob_size" 2>&1 | log_output
     wait_confirm "压缩配置完成"
-}
-
-configure_osd_limits() {
-    log_section "配置 OSD 限制"
-    log_info "设置 osd_max_object_size = 512MB ..."
-    ./bin/ceph tell osd.* injectargs --osd_max_object_size=536870912 2>&1 | log_output
-    wait_confirm "OSD 限制配置完成"
 }
 
 # ============================================================
@@ -325,10 +309,22 @@ show_compression_logs() {
     } | log_output
 }
 
+n() {
+    # 生成可复现的命令行（含正确转义）
+    local cmd
+    cmd="$(printf '%q ' "$0" "$@")"
+    log_result "CMD: ${cmd% }"
+
+    log_result "$(cat ../src/compressor/hrac/HracCompressor.h | grep "const uint32_t HRAC_INNER")"
+
+    log_result "start configs: ${START_CONFIGS[*]}"
+}
+
 # ============================================================
 # 主函数
 # ============================================================
 main() {
+    # 记录调用指令到 result
     parse_args "$@"
 
     cd ../build
@@ -343,7 +339,7 @@ main() {
     log_info "配置参数:"
     log_info "  - 启动 Ceph: $START_CEPH"
     log_info "  - 临时目录: $TMPDIR"
-    log_info "  - 数据文件: $DATA_FILE (相对于 build 目录)"
+    log_info "  - 数据文件: $DATA_FILE"
     log_info "  - 对象名称: $OBJECT_NAME"
     if [ "$START_CEPH" = true ]; then
         # 只在启动时设定 
@@ -363,9 +359,9 @@ main() {
         exit 1
     fi
     
+    n "$@"
     create_tmpdir
     start_ceph_cluster
-    configure_osd_limits
     create_test_pool
     upload_real_file
     download_real_file
