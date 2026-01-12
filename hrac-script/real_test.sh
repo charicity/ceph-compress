@@ -17,6 +17,7 @@ DATA_FILE="real-data.fits"       # 位于 ../build 下
 OBJECT_NAME="real-data.fits"
 BLOCK_SIZE=16777216  # 16MB
 VERBOSE=false
+SIMPLE_CLUSTER=false
 RUN_LOG_FILENAME=""
 RUN_LOG_FILE=""
 
@@ -48,6 +49,10 @@ parse_args() {
                 ;;
             -v|--verbose)
                 VERBOSE=true
+                shift
+                ;;
+            --simple-cluster)
+                SIMPLE_CLUSTER=true
                 shift
                 ;;
             *)
@@ -158,7 +163,9 @@ start_ceph_cluster() {
         wait_confirm "Ceph 集群关闭完成"
         # create_config
         log_info "正在启动 Ceph 集群..."
-        MON=1 OSD=1 MDS=0 MGR=1 ../src/vstart.sh -d -n -x --without-dashboard \
+        if [ "$SIMPLE_CLUSTER" = true ]; then
+            log_info "使用简单集群配置"
+            MON=1 OSD=1 MDS=0 MGR=1 ../src/vstart.sh -d -n -x --without-dashboard \
             -o "osd_max_object_size = 536870912" \
             -o "bluestore_compression_mode = force" \
             -o "bluestore_compression_algorithm = hrac" \
@@ -171,6 +178,22 @@ start_ceph_cluster() {
             -o "bluestore_compression_min_blob_size_hdd = $BLOCK_SIZE" \
             -o "bluestore_max_blob_size_hdd = $BLOCK_SIZE" \
             -o "bluestore_compression_max_blob_size_hdd = $BLOCK_SIZE" 2>&1 | log_output
+        else
+            log_info "使用默认集群配置"
+            ../src/vstart.sh -d -n -x --without-dashboard \
+            -o "osd_max_object_size = 536870912" \
+            -o "bluestore_compression_mode = force" \
+            -o "bluestore_compression_algorithm = hrac" \
+            -o "bluestore_max_blob_size = $BLOCK_SIZE" \
+            -o "bluestore_max_blob_size_ssd = $BLOCK_SIZE" \
+            -o "bluestore_compression_min_blob_size = $BLOCK_SIZE" \
+            -o "bluestore_compression_min_blob_size_ssd = $BLOCK_SIZE" \
+            -o "bluestore_compression_max_blob_size = $BLOCK_SIZE" \
+            -o "bluestore_compression_max_blob_size_ssd = $BLOCK_SIZE" \
+            -o "bluestore_compression_min_blob_size_hdd = $BLOCK_SIZE" \
+            -o "bluestore_max_blob_size_hdd = $BLOCK_SIZE" \
+            -o "bluestore_compression_max_blob_size_hdd = $BLOCK_SIZE" 2>&1 | log_output
+        fi
         wait_confirm "Ceph 集群重启完成"
         configure_compression
     else
@@ -326,6 +349,7 @@ main() {
         # 只在启动时设定 
         log_info "  - 压缩块大小: $BLOCK_SIZE 字节"
     fi
+    log_info "  - 简单集群: $SIMPLE_CLUSTER"
     log_info "  - 实时显示: $VERBOSE"
     log_info "  - 日志文件: $RUN_LOG_FILE"
     if [ "$VERBOSE" = true ]; then
@@ -344,8 +368,8 @@ main() {
     configure_osd_limits
     create_test_pool
     upload_real_file
-    # download_real_file
-    # verify_integrity
+    download_real_file
+    verify_integrity
     check_compression_ratio
     show_compression_logs
     

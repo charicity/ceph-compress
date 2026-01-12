@@ -162,7 +162,7 @@ public:
                   << dendl;
 
     fits_kdecomp_u8(input_raw, actual_compressed_len, output_raw, origin_len,
-                    HRAC_BLK, origin_len, HRAC_INNER);
+                    HRAC_BLK, HRAC_NSBLK, HRAC_INNER);
 
     ldout(cct, 0) << "HRAC_DEBUG: decompress() Decompression done." << dendl;
 

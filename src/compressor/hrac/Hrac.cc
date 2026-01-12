@@ -1971,10 +1971,15 @@ uint32_t fits_kdecomp_u8(const uint8_t in[], const uint32_t iLen, dtype out[],
   uint32_t ibleft = 0;
   const uint32_t scc = nsblk / blk - 1, lft = nsblk % blk + blk;
 
+  ldout(g_ceph_context, 20)
+      << "HRAC_INFO: fits_kdecomp_u8() iLen=" << iLen << ", oLen=" << oLen
+      << "bigBlock=" << bigBlock << ", scc=" << scc << ", lft=" << lft << dendl;
+
   dtype *rw = (dtype *)aligned_alloc(64, sizeof(dtype) * lft);
   uint32_t *bkt = (uint32_t *)aligned_alloc(64, sizeof(uint32_t) * (BW + 1));
   if (!bkt || !rw) {
-    printf("error: aligned_alloc failed.\n");
+    ldout(g_ceph_context, 0)
+        << "HRAC_ERROR: fits_kdecomp_u8() aligned_alloc failed." << dendl;
     return 0;
   }
 
@@ -2097,6 +2102,9 @@ uint32_t fits_kdecomp_u8(const uint8_t in[], const uint32_t iLen, dtype out[],
 
   free(bkt);
   free(rw);
+  ldout(g_ceph_context, 0)
+      << "HRAC_DEBUG: fits_kdecomp_u8() completed, input size=" << iLen
+      << ", output size=" << k << dendl;
   return k;
 }
 
