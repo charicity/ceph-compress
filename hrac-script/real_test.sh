@@ -66,11 +66,7 @@ parse_args() {
 
     START_CONFIGS=(
             -o "osd_max_object_size = 536870912"
-            -o "bluestore_compression_algorithm = hrac"
-            -o "bluestore_compression_mode = force"
             -o "bluestore_max_blob_size = $BLOCK_SIZE"
-            -o "bluestore_compression_min_blob_size = $BLOCK_SIZE"
-            -o "bluestore_compression_max_blob_size = $BLOCK_SIZE"
         )
 }
 
@@ -149,21 +145,6 @@ create_tmpdir() {
 # ============================================================
 # 第三部分：启动 Ceph 集群（可选）
 # ============================================================
-create_config() {
-  if [ "$START_CEPH" = true ]; then
-    log_section "创建 Ceph 配置文件"
-    # 在 build 目录内创建 ceph.conf
-    cat <<EOF > ./ceph.conf
-[global]
-plugin dir = lib
-erasure code dir = lib
-EOF
-    export CEPH_CONF="$(pwd)/ceph.conf"
-    log_info "配置文件已创建: $CEPH_CONF"
-  else
-    log_info "跳过 创建 Ceph 配置文件（使用 -s 参数启用）"
-  fi
-}
 
 start_ceph_cluster() {
     log_section "重启 Ceph 集群"
@@ -216,12 +197,12 @@ create_test_pool() {
     log_info "启用 rados 应用..."
     ./bin/ceph osd pool application enable testpool rados 2>&1 | log_output
     
-    log_info "设置池压缩算法..."
-    ./bin/ceph osd pool set testpool compression_algorithm hrac 2>&1 | log_output
-    
     log_info "设置池压缩模式..."
+    ./bin/ceph osd pool set testpool compression_algorithm hrac 2>&1 | log_output
     ./bin/ceph osd pool set testpool compression_mode force 2>&1 | log_output
-    
+    ./bin/ceph osd pool set testpool compression_min_blob_size "$BLOCK_SIZE" 2>&1 | log_output
+    ./bin/ceph osd pool set testpool compression_max_blob_size "$BLOCK_SIZE" 2>&1 | log_output
+
     wait_confirm "测试池创建完成"
 }
 
