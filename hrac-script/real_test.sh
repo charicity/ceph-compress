@@ -1,19 +1,21 @@
 #!/bin/bash
 
 # ============================================================
-# HRAC 压缩算法实数据测试脚本
-# 用法: ./real_test.sh [选项]
-#   -h, --help          显示帮助信息
+# 压缩算法实数据测试脚本 (调用中间件版)
 # ============================================================
 
 set -e
+
+# 获取当前脚本所在目录，以便定位 rw_check.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RW_TOOL="$SCRIPT_DIR/rw_check.sh"
 
 # ============================================================
 # 默认配置
 # ============================================================
 START_CEPH=false
-TMPDIR="./real_test_tmp"
-DATA_FILE="../hrac-script/data/real-data.fits" 
+TMPDIR="$(realpath "$SCRIPT_DIR/logs/real_test_tmp")"
+DATA_FILE="$(realpath "$SCRIPT_DIR/data/real-data.fits")"
 OBJECT_NAME="real-data.fits"
 BLOCK_SIZE=16777216  # 16MB
 VERBOSE=false
@@ -21,6 +23,8 @@ SIMPLE_CLUSTER=false
 RUN_LOG_FILENAME=""
 RUN_LOG_FILE=""
 START_CONFIGS=""
+COMPRESSOR="hrac"
+POOL_NAME="test_pool"
 
 # ============================================================
 # 第一部分：参数解析函数
@@ -56,6 +60,10 @@ parse_args() {
                 SIMPLE_CLUSTER=true
                 shift
                 ;;
+            -com|--compressor)
+                COMPRESSOR="$2"
+                shift 2
+                ;;
             *)
                 echo "未知参数: $1"
                 show_help
@@ -71,7 +79,7 @@ parse_args() {
 }
 
 show_help() {
-    echo "HRAC 压缩算法实数据测试脚本"
+    echo "压缩算法实数据测试脚本"
     echo ""
     echo "用法: $0 [选项]"
     echo ""
@@ -83,6 +91,7 @@ show_help() {
     echo "  -b, --block         设置压缩块大小（默认 64KB，单位字节）"
     echo "  -v, --verbose       实时显示输出到终端（默认关闭）"
     echo "  --simple-cluster    设置使用简易集群启动（默认关闭）"
+    echo "  -com, --compressor  设置压缩算法（默认 hrac）"
     echo ""
     echo "示例:"
     echo "  $0                          # 使用默认配置"
@@ -115,152 +124,116 @@ log_section() {
 }
 
 log_result() {
-    local result_log_path="../hrac-script/logs/result"
+    local result_log_path="$SCRIPT_DIR/logs/result"
     mkdir -p "$result_log_path"
-    # 同时输出到 result 和 run 日志
     if [ -n "$1" ]; then
-        # 如果有参数,使用参数
         echo "$1" | tee -a "$result_log_path/$RUN_LOG_FILENAME" | log_output
     else
-        # 否则从标准输入读取
         tee -a "$result_log_path/$RUN_LOG_FILENAME" | log_output
     fi
 }
 
 wait_confirm() {
-    # read -p "[WAIT] $1，按 Enter 继续..."
     true
 }
 
 # ============================================================
-# 第二部分：创建临时目录
+# 环境与集群设置函数 (保持不变)
 # ============================================================
 create_tmpdir() {
     log_section "创建临时目录"
     mkdir -p "$TMPDIR"
     log_info "临时目录: $TMPDIR"
-    wait_confirm "临时目录创建完成"
 }
-
-# ============================================================
-# 第三部分：启动 Ceph 集群（可选）
-# ============================================================
 
 start_ceph_cluster() {
     log_section "重启 Ceph 集群"
-    
     if [ "$START_CEPH" = true ]; then
         log_info "正在关闭 Ceph 集群..."
         ../src/stop.sh 2>&1 | log_output || true
-        wait_confirm "Ceph 集群关闭完成"
         
-        # 定义配置数组
-
         log_info "正在启动 Ceph 集群..."
         if [ "$SIMPLE_CLUSTER" = true ]; then
-            log_info "使用简单集群配置"
             MON=1 OSD=1 MDS=0 MGR=1 ../src/vstart.sh -d -n -x --without-dashboard \
             "${START_CONFIGS[@]}" 2>&1 | log_output
         else
-            log_info "使用默认集群配置"
             ../src/vstart.sh -d -n -x --without-dashboard \
             "${START_CONFIGS[@]}" 2>&1 | log_output
         fi
-        wait_confirm "Ceph 集群重启完成"
         configure_compression
     else
-        log_info "跳过 Ceph 集群重启（使用 -s 参数启用）"
+        log_info "跳过 Ceph 集群重启"
     fi
 }
 
-# ============================================================
-# 第四部分：配置 HRAC 压缩
-# ============================================================
 configure_compression() {
     log_info "验证配置..."
-    # 检查配置
     ./bin/ceph daemon osd.0 config show | grep -E "bluestore_compression|blob_size" 2>&1 | log_output
-    wait_confirm "压缩配置完成"
 }
 
-# ============================================================
-# 第五部分：创建测试池
-# ============================================================
 create_test_pool() {
     log_section "创建测试池"
-    log_info "删除已存在的 testpool（如果有）..."
-    ./bin/ceph osd pool delete testpool testpool --yes-i-really-really-mean-it 2>&1 | log_output || true
+    ./bin/ceph osd pool delete $POOL_NAME $POOL_NAME --yes-i-really-really-mean-it 2>&1 | log_output || true
+    ./bin/ceph osd pool create $POOL_NAME 16 16 2>&1 | log_output
+    ./bin/ceph osd pool application enable $POOL_NAME rados 2>&1 | log_output
     
-    log_info "创建新的 testpool..."
-    ./bin/ceph osd pool create testpool 16 16 2>&1 | log_output
-    
-    log_info "启用 rados 应用..."
-    ./bin/ceph osd pool application enable testpool rados 2>&1 | log_output
-    
-    log_info "设置池压缩模式..."
-    ./bin/ceph osd pool set testpool compression_algorithm hrac 2>&1 | log_output
-    ./bin/ceph osd pool set testpool compression_mode force 2>&1 | log_output
-    ./bin/ceph osd pool set testpool compression_min_blob_size "$BLOCK_SIZE" 2>&1 | log_output
-    ./bin/ceph osd pool set testpool compression_max_blob_size "$BLOCK_SIZE" 2>&1 | log_output
-
-    wait_confirm "测试池创建完成"
+    log_section "设置池的压缩参数"
+    ./bin/ceph osd pool set $POOL_NAME compression_algorithm $COMPRESSOR 2>&1 | log_output
+    ./bin/ceph osd pool set $POOL_NAME compression_mode force 2>&1 | log_output
+    ./bin/ceph osd pool set $POOL_NAME compression_min_blob_size "$BLOCK_SIZE" 2>&1 | log_output
+    ./bin/ceph osd pool set $POOL_NAME compression_max_blob_size "$BLOCK_SIZE" 2>&1 | log_output
 }
 
 # ============================================================
-# 第六部分：上传/下载/校验（单文件）
+# 核心修改：调用中间件进行读写与校验
 # ============================================================
-upload_real_file() {
-    if [ -f "$DATA_FILE" ]; then
-        log_section "上传文件到 testpool"
-        log_info "上传: $OBJECT_NAME <- $DATA_FILE"
-        ./bin/rados -p testpool -b "$BLOCK_SIZE" put "$OBJECT_NAME" "$DATA_FILE" 2>&1 | log_output
-        log_info "上传完成"
-        wait_confirm "文件上传完成"
+run_rw_check() {
+    local mode="$1" # --put 或 --get
+    local msg="$2"
+    
+    log_section "$msg"
+    
+    # 构造命令参数
+
+    local cmd=(
+        "$RW_TOOL"
+        "$mode"
+        --pool "$POOL_NAME"
+        --block "$BLOCK_SIZE"
+        --object "$OBJECT_NAME"
+        --input "$DATA_FILE"
+        --tmp "$TMPDIR"
+        --bin-dir "./bin"
+    )
+
+    if [ "$VERBOSE" = true ]; then
+        cmd+=(--verbose)
+    fi
+
+    # 执行并记录日志
+    log_info "执行指令: ${cmd[*]}"
+    "${cmd[@]}" 2>&1 | log_output
+    
+    # 检查返回值
+    if [ $? -eq 0 ]; then
+        if [ "$mode" == "--get" ]; then
+            log_result "$OBJECT_NAME: ✓ PASS (Integrity Verified)"
+        fi
     else
-        echo "[ERROR] 未找到数据文件: $DATA_FILE"
+        log_result "$OBJECT_NAME: ✗ FAIL (Operation Failed)"
         exit 1
     fi
 }
 
-download_real_file() {
-    log_section "从 testpool 下载文件"
-    log_info "下载: $OBJECT_NAME -> $TMPDIR/retrieved_$OBJECT_NAME"
-    ./bin/rados -p testpool -b "$BLOCK_SIZE" get "$OBJECT_NAME" "$TMPDIR/retrieved_$OBJECT_NAME" 2>&1 | log_output
-    log_info "下载完成"
-    wait_confirm "文件下载完成"
-}
-
-verify_integrity() {
-    log_section "数据完整性校验"
-    {
-        if diff -q "$DATA_FILE" "$TMPDIR/retrieved_$OBJECT_NAME" > /dev/null 2>&1; then
-            echo "$OBJECT_NAME: ✓ PASS"
-            echo "所有文件校验通过！"
-        else
-            echo "$OBJECT_NAME: ✗ FAIL"
-            echo "警告: 完整性校验失败"
-        fi
-    } | log_result
-    wait_confirm "完整性校验完成"
-}
-
 # ============================================================
-# 第七部分：压缩率与日志
+# 统计与日志函数 (保持不变)
 # ============================================================
 check_compression_ratio() {
     log_section "压缩率检测"
-    
-    log_info "等待数据刷盘..."
     sleep 2
-    ./bin/ceph osd pool stats testpool 2>&1 | log_output || true
-    
-    if [ "$VERBOSE" = true ]; then
-        echo "" | tee -a "$RUN_LOG_FILE"
-    else
-        echo "" >> "$RUN_LOG_FILE"
-    fi
+    ./bin/ceph osd pool stats $POOL_NAME 2>&1 | log_output || true
+    echo "" >> "$RUN_LOG_FILE"
     ./bin/ceph df detail 2>&1 | log_result
-    log_info "log path: $result_log_path/$RUN_LOG_FILENAME"
 }
 
 show_compression_logs() {
@@ -291,49 +264,38 @@ show_compression_logs() {
 }
 
 n() {
-    # 生成可复现的命令行（含正确转义）
     local cmd
     cmd="$(printf '%q ' "$0" "$@")"
     log_result "CMD: ${cmd% }"
+}
 
-    log_result "$(cat ../src/compressor/hrac/HracCompressor.h | grep "const uint32_t HRAC_INNER")"
-
-    log_result "start configs: ${START_CONFIGS[*]}"
+clean_tmp_dir() {
+    log_section "清理临时目录"
+    rm -rf "$TMPDIR"
+    log_info "已删除临时目录: $TMPDIR"
 }
 
 # ============================================================
 # 主函数
 # ============================================================
 main() {
-    # 记录调用指令到 result
     parse_args "$@"
 
+    # 切换到 build 目录，不然 vstart 和 ceph 调用都会报错
     cd ../build
     
-    # 初始化日志文件
+    # 初始化日志
     local run_log_path="../hrac-script/logs/run"
     mkdir -p "$run_log_path"
     RUN_LOG_FILENAME="real_$(date +%Y%m%d_%H%M%S).txt"
     RUN_LOG_FILE="$run_log_path/$RUN_LOG_FILENAME"
     
-    log_section "HRAC 压缩算法实数据测试"
+    log_section "HRAC 压缩算法真实数据测试"
     log_info "配置参数:"
     log_info "  - 启动 Ceph: $START_CEPH"
     log_info "  - 临时目录: $TMPDIR"
     log_info "  - 数据文件: $DATA_FILE"
     log_info "  - 对象名称: $OBJECT_NAME"
-    if [ "$START_CEPH" = true ]; then
-        # 只在启动时设定 
-        log_info "  - 压缩块大小: $BLOCK_SIZE 字节"
-    fi
-    log_info "  - 简单集群: $SIMPLE_CLUSTER"
-    log_info "  - 实时显示: $VERBOSE"
-    log_info "  - 日志文件: $RUN_LOG_FILE"
-    if [ "$VERBOSE" = true ]; then
-        echo "" | tee -a "$RUN_LOG_FILE"
-    else
-        echo "" >> "$RUN_LOG_FILE"
-    fi
     
     if [ ! -f "$DATA_FILE" ]; then
         echo "[ERROR] 数据文件不存在: $(pwd)/$DATA_FILE"
@@ -344,11 +306,16 @@ main() {
     create_tmpdir
     start_ceph_cluster
     create_test_pool
-    upload_real_file
-    download_real_file
-    verify_integrity
+    
+    # --- 修改点：调用中间件 ---
+    run_rw_check "--put" "上传文件到 $POOL_NAME"
+    run_rw_check "--get" "下载文件并校验完整性"
+    # ------------------------
+    
     check_compression_ratio
     show_compression_logs
+
+    clean_tmp_dir
     
     log_section "测试完成"
 }
