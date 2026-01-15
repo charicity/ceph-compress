@@ -8,15 +8,15 @@ set -e
 
 # 获取当前脚本所在目录，以便定位 rw_check.sh
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RW_TOOL="$SCRIPT_DIR/rw_check.sh"
+RW_TOOL="$SCRIPT_DIR/../rw-script/rw_check.sh"
 
 # ============================================================
 # 默认配置
 # ============================================================
 START_CEPH=false
-TMPDIR="$(realpath "$SCRIPT_DIR/logs/real_test_tmp")"
+TMPDIR=$SCRIPT_DIR/logs/tmpdata
 DATA_FILE="$(realpath "$SCRIPT_DIR/data/real-data.fits")"
-OBJECT_NAME="real-data.fits"
+OBJECT_NAME="test_object"
 BLOCK_SIZE=16777216  # 16MB
 VERBOSE=false
 SIMPLE_CLUSTER=false
@@ -24,7 +24,7 @@ RUN_LOG_FILENAME=""
 RUN_LOG_FILE=""
 START_CONFIGS=""
 COMPRESSOR="hrac"
-POOL_NAME="test_pool"
+POOL_NAME="test_compressor_pool"
 
 # ============================================================
 # 第一部分：参数解析函数
@@ -62,6 +62,10 @@ parse_args() {
                 ;;
             -com|--compressor)
                 COMPRESSOR="$2"
+                shift 2
+                ;;
+            -d|--data-file)
+                DATA_FILE="$SCRIPT_DIR/data/$2"
                 shift 2
                 ;;
             *)
@@ -160,13 +164,13 @@ start_ceph_cluster() {
             ../src/vstart.sh -d -n -x --without-dashboard \
             "${START_CONFIGS[@]}" 2>&1 | log_output
         fi
-        configure_compression
+        configure_verification
     else
         log_info "跳过 Ceph 集群重启"
     fi
 }
 
-configure_compression() {
+configure_verification() {
     log_info "验证配置..."
     ./bin/ceph daemon osd.0 config show | grep -E "bluestore_compression|blob_size" 2>&1 | log_output
 }
@@ -230,7 +234,10 @@ run_rw_check() {
 # ============================================================
 check_compression_ratio() {
     log_section "压缩率检测"
-    sleep 2
+
+    # 等待统计
+    sleep 5
+
     ./bin/ceph osd pool stats $POOL_NAME 2>&1 | log_output || true
     echo "" >> "$RUN_LOG_FILE"
     ./bin/ceph df detail 2>&1 | log_result
@@ -293,9 +300,12 @@ main() {
     log_section "HRAC 压缩算法真实数据测试"
     log_info "配置参数:"
     log_info "  - 启动 Ceph: $START_CEPH"
+    log_info "  - 输入文件名: $DATA_FILE"
     log_info "  - 临时目录: $TMPDIR"
-    log_info "  - 数据文件: $DATA_FILE"
-    log_info "  - 对象名称: $OBJECT_NAME"
+    log_info "  - 压缩块大小: $BLOCK_SIZE"
+    log_info "  - 压缩算法: $COMPRESSOR"
+    log_info "  - 详细输出: $VERBOSE"
+    log_info "  - 运行日志: $RUN_LOG_FILE"
     
     if [ ! -f "$DATA_FILE" ]; then
         echo "[ERROR] 数据文件不存在: $(pwd)/$DATA_FILE"
