@@ -338,10 +338,10 @@ run_rw_check() {
 
     # 执行并记录日志
     log_info "执行指令: ${cmd[*]}"
-    "${cmd[@]}" 2>&1 | log_output
+    "${cmd[@]}" 2>&1 | log_output; local exit_code=$?
     
     # 检查返回值
-    if [ $? -eq 0 ]; then
+    if [ $exit_code -eq 0 ]; then
         if [ "$mode" == "--get" ]; then
             log_result "$filename: ✓ PASS (Integrity Verified)"
         fi

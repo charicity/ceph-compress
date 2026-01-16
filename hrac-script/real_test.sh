@@ -77,7 +77,7 @@ parse_args() {
     done
 
     START_CONFIGS=(
-            -o "osd_max_object_size = 536870912"
+            -o "osd_max_object_size = 2147483648"
             -o "bluestore_max_blob_size = $BLOCK_SIZE"
         )
 }
@@ -90,10 +90,11 @@ show_help() {
     echo "选项:"
     echo "  -s, --start-ceph    启动 Ceph 集群（默认关闭）"
     echo "  -t, --tmpdir        临时目录路径（默认 ./real_test_tmp）"
-    echo "  -o, --object-name   写入对象名（默认 real-data.fits）"
+    echo "  -o, --object-name   写入对象名（默认 test_object）"
     echo "  -h, --help          显示帮助信息"
     echo "  -b, --block         设置压缩块大小（默认 64KB，单位字节）"
     echo "  -v, --verbose       实时显示输出到终端（默认关闭）"
+    echo "  -d, --data-file     设置输入数据文件（默认 real-data.fits）"
     echo "  --simple-cluster    设置使用简易集群启动（默认关闭）"
     echo "  -com, --compressor  设置压缩算法（默认 hrac）"
     echo ""
@@ -216,10 +217,10 @@ run_rw_check() {
 
     # 执行并记录日志
     log_info "执行指令: ${cmd[*]}"
-    "${cmd[@]}" 2>&1 | log_output
+    "${cmd[@]}" 2>&1 | log_output; local exit_code=$?
     
     # 检查返回值
-    if [ $? -eq 0 ]; then
+    if [ $exit_code -eq 0 ]; then
         if [ "$mode" == "--get" ]; then
             log_result "$OBJECT_NAME: ✓ PASS (Integrity Verified)"
         fi

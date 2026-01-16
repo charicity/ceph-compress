@@ -19,9 +19,11 @@
 #define dout_prefix *_dout << "hrac: "
 
 const uint32_t HRAC_BLK = 64;
-const uint32_t HRAC_NSBLK = 1024;
-// const uint32_t HRAC_INNER = 1;
-const uint32_t HRAC_INNER = 16384;
+
+const uint32_t HRAC_NSBLK = 65536;
+const uint32_t HRAC_INNER = 16;
+// const uint32_t HRAC_NSBLK = 1024;
+// const uint32_t HRAC_INNER = 16384;
 
 #define dtype uint8_t
 #define diff_e diff_e8
