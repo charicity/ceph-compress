@@ -330,3 +330,40 @@ MVP 必须同时满足：
 3. 回放工具支持完整重放、checkpoint 续跑与 `--verify-only` 校验。
 4. 至少一次破坏性恢复演练并产出 RTO 报告。
 5. 文档包含配置说明、恢复步骤、审计项与已知限制。
+
+---
+
+## 12. 当前进度摘要（2026-03-03）
+
+### 12.1 PR-1 完成状态
+
+已完成 **PR-1：配置项与开关骨架（不改数据路径）**，并通过构建与运行时测试验证。
+
+**已落地内容：**
+- 新增配置项（6 个）：
+  - `bluerocks_wal_bypass_enable`
+  - `bluerocks_wal_bypass_dir`
+  - `bluerocks_wal_rotate_size_mb`
+  - `bluerocks_wal_rotate_interval_sec`
+  - `bluerocks_wal_flush_trigger_kb`
+  - `bluerocks_wal_flush_interval_ms`
+- `BlueStore::get_tracked_keys()` 已接入上述配置键。
+- `BlueStore::handle_conf_change()` 已接入对应变更分支（骨架处理，不改变数据路径语义）。
+
+### 12.2 测试结论（PR-1）
+
+- `ceph-osd --show-config-value` 可读取 6 个新键默认值。
+- 使用临时配置文件覆盖后，可读回覆盖值。
+- 在运行中的 `osd.0` 执行 `ceph config set` 后，
+  `ceph daemon osd.0 config get/config diff` 可确认值已生效。
+- 执行 `ceph config rm` 后可回滚至默认值。
+
+### 12.3 文档留档
+
+- 已新增测试留档文档：`doc/wal/pr1-config-validation.rst`
+  - 记录了测试方法、关键命令、结果与回滚验证。
+
+### 12.4 下一步建议
+
+- 进入 PR-2：在 `BlueRocksEnv` / `BlueRocksWritableFile::Append` 实现 WAL 旁路双缓冲主干，
+  并保持开关关闭时路径零影响。
