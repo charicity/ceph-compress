@@ -5830,7 +5830,13 @@ std::vector<std::string> BlueStore::get_tracked_keys() const noexcept
     "bluestore_onode_segment_size"s,
     "bluestore_allocator_lookup_policy"s,
     "bluestore_volume_selection_reserved_factor"s,
-    "bluestore_volume_selection_reserved"s
+    "bluestore_volume_selection_reserved"s,
+    "bluerocks_wal_bypass_enable"s,
+    "bluerocks_wal_bypass_dir"s,
+    "bluerocks_wal_rotate_size_mb"s,
+    "bluerocks_wal_rotate_interval_sec"s,
+    "bluerocks_wal_flush_trigger_kb"s,
+    "bluerocks_wal_flush_interval_ms"s
   };
 }
 
@@ -5909,6 +5915,14 @@ void BlueStore::handle_conf_change(const ConfigProxy& conf,
     changed.count("bluestore_volume_selection_reserved")) {
     if (bluefs)
       bluefs->update_volume_selector_from_config();
+  }
+  if (changed.count("bluerocks_wal_bypass_enable") ||
+      changed.count("bluerocks_wal_bypass_dir") ||
+      changed.count("bluerocks_wal_rotate_size_mb") ||
+      changed.count("bluerocks_wal_rotate_interval_sec") ||
+      changed.count("bluerocks_wal_flush_trigger_kb") ||
+      changed.count("bluerocks_wal_flush_interval_ms")) {
+    dout(10) << __func__ << " observed bluerocks wal bypass config change (skeleton only)" << dendl;
   }
 }
 

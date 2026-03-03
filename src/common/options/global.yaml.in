@@ -4515,6 +4515,81 @@ options:
   flags:
   - create
   with_legacy: true
+- name: bluerocks_wal_bypass_enable
+  type: bool
+  level: dev
+  desc: Enable bypass capture of RocksDB WAL stream to an external directory
+  default: false
+  services:
+  - osd
+  flags:
+  - runtime
+  with_legacy: false
+- name: bluerocks_wal_bypass_dir
+  type: str
+  level: dev
+  desc: Directory path for writing bypass-captured RocksDB WAL files
+  services:
+  - osd
+  see_also:
+  - bluerocks_wal_bypass_enable
+  flags:
+  - runtime
+  with_legacy: false
+- name: bluerocks_wal_rotate_size_mb
+  type: uint
+  level: dev
+  desc: Rotate bypass WAL output file when file size reaches this threshold in MiB
+  default: 1024
+  min: 1
+  services:
+  - osd
+  see_also:
+  - bluerocks_wal_bypass_enable
+  - bluerocks_wal_bypass_dir
+  flags:
+  - runtime
+  with_legacy: false
+- name: bluerocks_wal_rotate_interval_sec
+  type: uint
+  level: dev
+  desc: Rotate bypass WAL output file when open duration reaches this threshold in seconds
+  default: 86400
+  min: 1
+  services:
+  - osd
+  see_also:
+  - bluerocks_wal_bypass_enable
+  - bluerocks_wal_bypass_dir
+  flags:
+  - runtime
+  with_legacy: false
+- name: bluerocks_wal_flush_trigger_kb
+  type: uint
+  level: dev
+  desc: Trigger asynchronous bypass buffer flush when pending bytes reach this threshold in KiB
+  default: 1024
+  min: 1
+  services:
+  - osd
+  see_also:
+  - bluerocks_wal_bypass_enable
+  flags:
+  - runtime
+  with_legacy: false
+- name: bluerocks_wal_flush_interval_ms
+  type: uint
+  level: dev
+  desc: Trigger asynchronous bypass buffer flush when this time interval elapses in milliseconds
+  default: 100
+  min: 1
+  services:
+  - osd
+  see_also:
+  - bluerocks_wal_bypass_enable
+  flags:
+  - runtime
+  with_legacy: false
 - name: bluestore_bdev_label_multi
   type: bool
   level: advanced
