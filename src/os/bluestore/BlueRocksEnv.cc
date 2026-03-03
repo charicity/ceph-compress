@@ -7,6 +7,13 @@
 #include "kv/RocksDBStore.h"
 #include "string.h"
 
+#include <chrono>
+#include <condition_variable>
+#include <fcntl.h>
+#include <mutex>
+#include <thread>
+#include <unistd.h>
+
 using std::string_view;
 
 namespace {
@@ -44,6 +51,189 @@ split(const std::string &fn)
           string_view(fn.data() + file_begin,
 	              fn.size() - file_begin)};
 }
+
+bool is_wal_file(const std::string& fname)
+{
+  // 根据后缀判断是否是 wal
+  // 是否过于草率了
+  constexpr std::string_view suffix = ".log";
+  return fname.size() >= suffix.size() &&
+    fname.compare(fname.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string file_basename(const std::string& path)
+{
+  size_t slash = path.rfind('/');
+  if (slash == std::string::npos || slash + 1 == path.size()) {
+    return path;
+  }
+  return path.substr(slash + 1);
+}
+
+class WalBypassCapture {
+private:
+  CephContext* m_cct;
+  int m_fd = -1;
+  bool m_enabled = false;       // 是否启用bypass捕获
+  bool m_stopping = false;      // 正在停止中
+  bool m_flush_pending = false; // 有待刷新的数据
+  bool m_failed = false;        // 写入失败
+  uint64_t m_flush_trigger_bytes = 1024 * 1024;
+  std::chrono::milliseconds m_flush_interval = std::chrono::milliseconds(100);
+  std::chrono::steady_clock::time_point m_last_enqueue = std::chrono::steady_clock::now();
+  std::string m_output_path;
+  std::string m_active_buffer;  // 主线程累积数据
+  std::string m_flush_buffer;   // 待写入的数据
+  std::mutex m_lock;
+  std::condition_variable m_cond;
+  std::thread m_worker;
+
+public:
+  WalBypassCapture(CephContext* cct,
+                   const std::string& source_fname,
+                   uint64_t source_ino)
+    : m_cct(cct) {
+    if (!m_cct->_conf.get_val<bool>("bluerocks_wal_bypass_enable")) {
+      return;
+    }
+
+    std::string bypass_dir = m_cct->_conf.get_val<std::string>("bluerocks_wal_bypass_dir");
+    if (bypass_dir.empty()) {
+      return;
+    }
+
+    uint64_t trigger_kb = m_cct->_conf.get_val<uint64_t>("bluerocks_wal_flush_trigger_kb");
+    uint64_t interval_ms = m_cct->_conf.get_val<uint64_t>("bluerocks_wal_flush_interval_ms");
+    if(trigger_kb == 0 || interval_ms == 0) {
+      return;
+    }
+
+    m_flush_trigger_bytes = trigger_kb * 1024;
+    m_flush_interval = std::chrono::milliseconds(interval_ms);
+
+    std::string source_base = file_basename(source_fname);
+    m_output_path = bypass_dir + "/" + source_base + ".bypass." +
+      stringify(getpid()) + "." + stringify(source_ino);
+
+    m_fd = ::open(m_output_path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (m_fd < 0) {
+      return;
+    }
+
+    m_enabled = true;
+    m_worker = std::thread(&WalBypassCapture::flush_loop, this);
+  }
+
+  ~WalBypassCapture() {
+    shutdown();
+  }
+
+  bool enabled() const {
+    return m_enabled;
+  }
+
+  void append(const char* data, size_t len) {
+    if (!m_enabled || m_failed || len == 0) {
+      return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    std::unique_lock lk(m_lock);
+    m_active_buffer.append(data, len);
+    if (m_active_buffer.size() >= m_flush_trigger_bytes ||
+        now - m_last_enqueue >= m_flush_interval) {
+      enqueue_flush_locked(now);
+    }
+  }
+
+private:
+  void enqueue_flush_locked(std::chrono::steady_clock::time_point now) {
+    if (m_active_buffer.empty()) {
+      return;
+    }
+
+    if (m_flush_pending) {
+      m_flush_buffer.append(m_active_buffer);
+      m_active_buffer.clear();
+    } else {
+      m_active_buffer.swap(m_flush_buffer);
+      m_flush_pending = true;
+    }
+    m_last_enqueue = now;
+    m_cond.notify_one();
+  }
+
+  bool write_all(const char* data, size_t len) {
+    size_t written = 0;
+    while (written < len) {
+      ssize_t r = ::write(m_fd, data + written, len - written);
+      if (r < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        return false;
+      }
+      written += r;
+    }
+    return true;
+  }
+
+  void flush_loop() {
+    std::string local;
+    std::unique_lock lk(m_lock);
+    while (true) {
+      if (!m_flush_pending) {
+        m_cond.wait_for(lk, m_flush_interval, [this] {
+          return m_flush_pending || m_stopping;
+        });
+        if (!m_flush_pending) {
+          enqueue_flush_locked(std::chrono::steady_clock::now());
+        }
+      }
+
+      if (m_flush_pending) {
+        local.swap(m_flush_buffer);
+        m_flush_pending = false;
+        lk.unlock();
+        if (!local.empty() && !write_all(local.data(), local.size())) {
+          m_failed = true;
+        }
+        local.clear();
+        lk.lock();
+      }
+
+      if (m_stopping && !m_flush_pending && m_active_buffer.empty()) {
+        break;
+      }
+    }
+  }
+
+  void shutdown() {
+    if (!m_enabled) {
+      return;
+    }
+
+    {
+      std::lock_guard lk(m_lock);
+      if (!m_active_buffer.empty()) {
+        enqueue_flush_locked(std::chrono::steady_clock::now());
+      }
+      m_stopping = true;
+      m_cond.notify_one();
+    }
+
+    if (m_worker.joinable()) {
+      m_worker.join();
+    }
+
+    if (m_fd >= 0) {
+      ::fsync(m_fd);
+      ::close(m_fd);
+      m_fd = -1;
+    }
+    m_enabled = false;
+  }
+};
 
 }
 
@@ -177,8 +367,22 @@ class BlueRocksRandomAccessFile : public rocksdb::RandomAccessFile {
 class BlueRocksWritableFile : public rocksdb::WritableFile {
   BlueFS *fs;
   BlueFS::FileWriter *h;
+  std::unique_ptr<WalBypassCapture> wal_bypass;
  public:
-  BlueRocksWritableFile(BlueFS *fs, BlueFS::FileWriter *h) : fs(fs), h(h) {}
+  BlueRocksWritableFile(BlueFS *fs,
+                        BlueFS::FileWriter *h,
+                        const std::string& fname,
+                        bool may_be_wal)
+    : fs(fs), h(h)
+  {
+    // may_be_wal 有点蠢，但是确实很有必要
+    if (may_be_wal && is_wal_file(fname)) {
+      wal_bypass = std::make_unique<WalBypassCapture>(
+        fs->cct,
+        fname,
+        h->file->fnode.ino);
+    }
+  }
   ~BlueRocksWritableFile() override {
     fs->close_writer(h);
   }
@@ -197,6 +401,9 @@ class BlueRocksWritableFile : public rocksdb::WritableFile {
 
   rocksdb::Status Append(const rocksdb::Slice& data) override {
     fs->append_try_flush(h, data.data(), data.size());
+    if (wal_bypass && wal_bypass->enabled()) {
+      wal_bypass->append(data.data(), data.size());
+    }
     return rocksdb::Status::OK();
   }
 
@@ -378,7 +585,7 @@ rocksdb::Status BlueRocksEnv::NewWritableFile(
   int r = fs->open_for_write(dir, file, &h, false);
   if (r < 0)
     return err_to_status(r);
-  result->reset(new BlueRocksWritableFile(fs, h));
+  result->reset(new BlueRocksWritableFile(fs, h, fname, true));
   return rocksdb::Status::OK();
 }
 
@@ -399,7 +606,7 @@ rocksdb::Status BlueRocksEnv::ReuseWritableFile(
   r = fs->open_for_write(new_dir, new_file, &h, true);
   if (r < 0)
     return err_to_status(r);
-  result->reset(new BlueRocksWritableFile(fs, h));
+  result->reset(new BlueRocksWritableFile(fs, h, new_fname, true));
   fs->sync_metadata(false);
   return rocksdb::Status::OK();
 }
