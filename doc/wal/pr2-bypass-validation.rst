@@ -107,3 +107,61 @@ PR-2 最小目标已达成：
 
 - 开关开启且 OSD 使用新 WAL writer 后，旁路文件可创建并持续增长；
 - 前台写入链路保持可用，旁路刷盘由后台线程异步执行。
+
+复测追加（2026-03-03）
+----------------------
+
+目标
+^^^^
+
+- 删除原有集群全部状态与临时文件；
+- 从头启动本地 ``vstart`` 3 OSD 集群；
+- 由 MON 下发旁路配置并验证；
+- 重跑写入压测并确认旁路文件增长。
+
+执行摘要
+^^^^^^^^
+
+1. 全量清理旧状态
+
+   - 执行 ``../src/stop.sh`` 停止旧集群；
+   - 清理 ``build/out``、``build/dev``、``build/asok``；
+   - 清理 ``/tmp/ceph-*``、``/tmp/vstart*``、``/tmp/wal_bypass_pr2``；
+   - 重建旁路目录 ``/tmp/wal_bypass_pr2``。
+
+2. 从零重建集群
+
+   - 执行 ``../src/vstart.sh --debug --new -x --localhost --bluestore``；
+   - 状态确认：``mon: 3 daemons``，``osd: 3 osds: 3 up, 3 in``。
+
+3. MON 下发配置并回读
+
+   - ``bluerocks_wal_bypass_enable = true``
+   - ``bluerocks_wal_bypass_dir = /tmp/wal_bypass_pr2``
+   - ``bluerocks_wal_flush_trigger_kb = 4``
+   - ``bluerocks_wal_flush_interval_ms = 50``
+
+4. 使配置对 WAL writer 生效并复测
+
+   - 停集群后执行 ``../src/vstart.sh --debug -x --localhost --bluestore``（不带 ``--new``，保留 MON 配置）；
+   - 执行 ``rados bench 6 write --no-cleanup``（池 ``pr2test``，``size=1``，``min_size=1``）；
+   - 统计旁路文件总字节变化。
+
+复测结果
+^^^^^^^^
+
+- 旁路文件存在且持续增长（实测 3 个 ``*.bypass.*`` 文件）。
+- 写入压测前后总字节：
+
+  - ``before_bytes = 57968918``
+  - ``after_bytes  = 63350849``
+  - ``delta_bytes  = 5381931``
+
+复测结论
+^^^^^^^^
+
+在“全量清理后重建 3 OSD + MON 下发配置”的流程下，PR-2 旁路写入行为稳定可复现：
+
+- 旁路文件可创建；
+- 压测期间旁路字节持续增长；
+- 前台写入与集群运行保持正常。
