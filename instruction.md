@@ -367,3 +367,19 @@ MVP 必须同时满足：
 
 - 进入 PR-2：在 `BlueRocksEnv` / `BlueRocksWritableFile::Append` 实现 WAL 旁路双缓冲主干，
   并保持开关关闭时路径零影响。
+
+### 12.5 PR-2 当前进度（2026-03-03）
+
+已完成 PR-2 最小实现与在线验证。
+
+**已落地内容：**
+- 在 `src/os/bluestore/BlueRocksEnv.cc` 增加 WAL 旁路器（双缓冲 + 后台线程）。
+- 在 `BlueRocksWritableFile::Append` 中实现 `.log` 文件旁路写入。
+- 保持主写路径不变：原 `append_try_flush` 逻辑未改语义。
+- 完成运行验证：旁路目录出现 `.bypass` 文件，压测期间字节持续增长。
+
+**关键设置注意事项（必须遵守）：**
+- 旁路器在 WAL 文件打开时读取开关，先前是“集群已开机后才 set 配置”，旧 WAL writer 不会自动切换。我会重启 OSD 进程（保留 mon 配置）后再跑一次写入验证。
+
+**留档位置：**
+- `doc/wal/pr2-bypass-validation.rst`
