@@ -24,6 +24,7 @@ if(WITH_RADOSGW_D4N)
 add_executable(ceph_test_rgw_d4n_filter
   test_d4n_filter.cc
   )
+target_link_options(ceph_test_rgw_d4n_filter PRIVATE -Wl,--no-as-needed)
 target_include_directories(ceph_test_rgw_d4n_filter
   SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/driver/d4n")
 target_link_libraries(ceph_test_rgw_d4n_filter PRIVATE

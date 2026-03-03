@@ -188,19 +188,17 @@ MVP 必须同时满足：
 ## 6. 风险清单与缓解
 
 - 回放时间不可接受：
-  - 缓解：分层存储、并行预处理（解析与校验）、离线演练确定 SLA。
+  - 在下一阶段改造中引入快照机制
 - 旁路链路静默失效：
   - 缓解：强告警 + 健康探针 + 周期性恢复演练。
-- 超长周期日志管理失控：
-  - 缓解：明确保留策略、归档流程、容量阈值与人工升级路径。
 
 ---
 
 ## 7. 里程碑验收标准
 
-- M1（旁路引擎）：连续 72h 压测无崩溃、无内存泄漏、无序号断裂。
+- M1（旁路引擎）：连续 10 min 压测无崩溃、无内存泄漏、无序号断裂。
 - M2（回放工具）：在测试集可完整回放并通过 OSD 启动与基础健康检查。
-- M3（灾备演练）：完成至少 3 次端到端破坏性恢复，RTO 统计稳定。
+- M3（灾备演练）：完成至少 2 次端到端破坏性恢复，RTO 统计稳定。
 
 ---
 
@@ -210,151 +208,125 @@ MVP 必须同时满足：
 - 回放并行化（按 CF/分片策略，需验证顺序语义）。
 - 与对象级/快照级备份机制融合，缩短超长 RTO。
 
+
 ---
 
 ## 9. 最小实现任务分解（按 Ceph 代码目录/符号）
 
-本节用于直接指导编码，优先采用“小步提交、可回滚”的 PR 切分。
-
 ### 9.1 PR-1：配置项与开关骨架（不改数据路径）
 
-**目标**：先把功能开关、参数与运行期可见性建好，但不做真实旁路写入。
+**目标**：先落地配置开关与参数，不改变数据路径行为。
 
 **改动文件（建议）**：
 - `src/common/options/global.yaml.in`
-  - 新增配置项：
-    - `bluerocks_wal_bypass_enable`（bool，默认 false）
-    - `bluerocks_wal_bypass_dir`（str）
-    - `bluerocks_wal_rotate_size_mb`（uint）
-    - `bluerocks_wal_rotate_interval_sec`（uint）
-    - `bluerocks_wal_flush_trigger_kb`（uint）
-    - `bluerocks_wal_flush_interval_ms`（uint）
-- `src/os/bluestore/BlueStore.cc`
-  - 在 `BlueStore::get_tracked_keys()` 注册以上键。
-  - 在 `BlueStore::handle_conf_change()` 增加配置变化处理入口（首版允许仅更新内存参数，不做热切换重建）。
+- `src/os/bluestore/BlueStore.cc`（`get_tracked_keys()` / `handle_conf_change()`）
 
 **验收标准**：
-- `ceph config get osd.<id> <key>` 可见新增参数。
-- OSD 启动/重启不报未知配置项。
+- 新增配置项可读可写，OSD 启停无未知键报错。
 
 ### 9.2 PR-2：WAL 旁路器内核（双缓冲 + 后台线程）
 
-**目标**：在不影响 RocksDB 正常写入的前提下，复制 `.log` 数据到独立目录。
+**目标**：在不阻塞 RocksDB 主写入线程前提下旁路 `.log` 数据。
 
 **改动文件（建议）**：
 - `src/os/bluestore/BlueRocksEnv.h`
-  - 新增旁路器类声明（建议独立类，如 `BlueRocksWalBypass`）。
-  - 保存必要状态：启停标记、双缓冲、互斥/条件变量、后台线程、当前轮转文件句柄、序号。
-- `src/os/bluestore/BlueRocksEnv.cc`
-  - 在 `class BlueRocksWritableFile` 中引入旁路器引用。
-  - 在 `BlueRocksWritableFile::Append(const rocksdb::Slice&)` 中：
-    1) 先调用现有 `fs->append_try_flush(...)`；
-    2) 再以“无阻塞主路径”为前提复制数据到旁路缓冲；
-    3) 若文件非 `.log` 直接跳过。
-  - 在析构/关闭路径补齐 `drain + flush + fsync + close`。
-
-**关键实现约束**：
-- 旁路失败不得导致 RocksDB 主写失败（仅记录错误和计数）。
-- 后台线程串行落盘，保证旁路文件内顺序。
-- 任何时候都不在 `Append()` 里执行独立盘同步 I/O。
+- `src/os/bluestore/BlueRocksEnv.cc`（`BlueRocksWritableFile::Append`）
 
 **验收标准**：
-- 开关关闭时行为与基线一致。
-- 开关开启后能在旁路目录持续看到 WAL 文件增长。
-- 压测下 OSD 前台延迟无明显突刺（以基线对比）。
+- 开关关闭时行为与基线一致；开启后旁路目录持续增长。
 
 ### 9.3 PR-3：严格轮转与序号持久化
 
-**目标**：实现可审计的 `size/time` 轮转，并保证重启后序号连续。
+**目标**：实现 size/time 轮转与重启后序号连续。
 
 **改动文件（建议）**：
 - `src/os/bluestore/BlueRocksEnv.cc`
-  - 轮转状态机：`maybe_rotate()` / `open_next_file()` / `finalize_current_file()`。
-  - 命名规则固定为 `ceph_wal_%010llu.log`。
-  - 文件头最小字段：`magic/version/file_seq/create_ts`。
-  - 启动时扫描旁路目录求最大序号，下一文件从 `max+1` 开始。
 
 **验收标准**：
-- 达到阈值后自动切换新文件。
-- 重启 OSD 后序号不回退、不重复。
-- 人工注入轮转点（高频切换）无数据丢失/乱序证据。
+- 高并发与频繁轮转下不丢失、不乱序、不重复序号。
 
 ### 9.4 PR-4：监控与告警可观测性
 
-**目标**：把旁路链路运行状态暴露给运维与压测。
+**目标**：暴露旁路链路核心指标。
 
 **改动文件（建议）**：
-- `src/os/bluestore/BlueStore.h`
-  - 在 `l_bluestore_*` 计数枚举中新增 WAL 旁路计数项。
-- `src/os/bluestore/BlueStore.cc`
-  - 在 `_init_logger()` 通过 `PerfCountersBuilder` 注册指标。
-  - 在旁路关键路径更新计数：总字节、轮转次数、flush 延迟、写失败次数、backlog。
+- `src/os/bluestore/BlueStore.h`（新增 `l_bluestore_*` 计数项）
+- `src/os/bluestore/BlueStore.cc`（`_init_logger()` 注册与更新）
 
 **验收标准**：
 - `ceph daemon osd.<id> perf dump` 可见新增字段。
-- 限速/满盘故障注入时，错误指标与日志同步增长。
 
 ### 9.5 PR-5：全量回放工具（MVP）
 
-**目标**：提供独立工具完成“目录扫描 -> WAL 解析 -> disableWAL 写入 -> 断点续跑”。
+**目标**：独立工具支持 scan/sort/replay/checkpoint/stop 条件。
 
 **改动文件（建议）**：
 - `src/tools/CMakeLists.txt`
-  - 新增可执行目标（建议名：`ceph-bluestore-wal-replay`）。
 - `src/tools/ceph_bluestore_wal_replay.cc`（新文件）
-  - CLI 参数：
-    - `--db-path`
-    - `--wal-dir`
-    - `--checkpoint-path`
-    - `--stop-ts`（可选）
-    - `--stop-seqno`（可选）
-  - 扫描并按文件名序号排序。
-  - 使用 RocksDB WAL 读取接口解析 `WriteBatch`。
-  - 对目标 DB 执行 `db->Write(write_opts, &batch)` 且 `write_opts.disableWAL=true`。
-  - 周期落盘 checkpoint：`file_seq + file_offset + last_applied_seqno`。
 
 **验收标准**：
-- 从空骨架 DB 回放到可打开状态。
-- 中断后可从 checkpoint 继续，不从头重放。
-- 指定 `--stop-*` 可稳定停在预期边界。
+- 从空骨架 DB 回放可成功打开；中断可续跑。
 
 ### 9.6 PR-6：测试与演练脚本（最小闭环）
 
-**目标**：形成可重复的回归与灾备演练流程。
+**目标**：建立可重复回归与灾备演练流程。
 
 **改动文件（建议）**：
-- `src/test/objectstore/` 下新增或扩展单测（优先围绕 BlueFS/BlueStore 测试框架）。
-  - 覆盖：
-    - 轮转边界；
-    - 序号连续性；
-    - 异常退出后的恢复可读性。
-- `qa/` 或 `src/script/` 增加最小演练脚本（可选，若本期范围允许）。
+- `src/test/objectstore/`（新增/扩展单测）
+- `qa/` 或 `src/script/`（演练脚本，可选）
 
 **验收标准**：
-- 单测可稳定复现并通过。
-- 至少 1 次端到端“mkfs + replay + 启动 OSD”演练记录。
+- 单测稳定通过；至少一次端到端 `mkfs + replay + OSD` 演练记录。
+
+### 9.7 PR-7：恢复一致性校验与回放审计
+
+**目标**：让回放结果“可证明正确”，而非仅“看起来可启动”。
+
+**改动文件（建议）**：
+- `src/tools/ceph_bluestore_wal_replay.cc`
+- `src/tools/` 下新增简易审计输出（可同文件实现）
+
+**实现要点**：
+- 回放时输出并持久化统计：处理文件数、batch 数、总字节、最后序号。
+- 增加 `--verify-only`（只扫描与校验，不写 DB）模式。
+- 检测序号断裂/文件缺失并返回非 0 退出码。
+
+**验收标准**：
+- 故意删掉中间 WAL 文件时，工具能明确报错并定位到文件序号。
+- 正常链路回放后，审计结果可重复。
+
+### 9.8 PR-8：运维手册与值班操作流程
+
+**目标**：形成值班可执行 SOP，降低恢复过程中人为错误率。
+
+**改动文件（建议）**：
+- `instruction.md`（本文件）
+- `doc/` 下新增或补充操作文档（如 `doc/rados/operations/`，按仓库规范放置）
+
+**实现要点**：
+- 明确“触发恢复”的判定条件。
+- 给出标准流程：`mkfs -> replay -> 启动 OSD -> 健康检查 -> 回写报告`。
+- 列出常见故障与处理：ENOSPC、回放中断、序号断裂、RTO 超时。
+
+**验收标准**：
+- 新值班同学按文档可独立完成一次演练。
+- 演练报告包含耗时分解与失败重试记录。
 
 ---
 
 ## 10. 开发顺序与时间估算（建议）
 
-- 周 1：PR-1 + PR-2（功能开关 + 双缓冲核心）
-- 周 2：PR-3 + PR-4（轮转可靠性 + 可观测性）
-- 周 3：PR-5（回放工具 MVP）
-- 周 4：PR-6（测试与演练，修正缺陷）
-
-并行建议：
-- 一名开发负责 OSD 内旁路链路（PR-1~4）。
-- 一名开发负责回放工具（PR-5）与演练脚本（PR-6）。
+- 周 1：PR-1 + PR-2
+- 周 2：PR-3 + PR-4
+- 周 3：PR-5 + PR-7
+- 周 4：PR-6 + PR-8
 
 ---
 
 ## 11. 交付清单（Definition of Done）
 
-满足以下全部条件才算本方案完成：
-
-1. OSD 开启旁路后，WAL 文件持续落到独立目录，且轮转序号严格连续。
-2. 独立盘异常时，OSD 主写路径不被阻断，并有明确告警与指标。
-3. 回放工具可对空骨架 DB 完整重放，并支持 checkpoint 续跑。
-4. 至少一次破坏性演练完成并产出 RTO 报告。
-5. 文档/运维手册包含配置说明、恢复步骤与已知限制。
+1. 旁路 WAL 持续写入，轮转序号严格连续。
+2. 独立盘异常时主写路径不阻断，且有明确告警与指标。
+3. 回放工具支持完整重放、checkpoint 续跑与 `--verify-only` 校验。
+4. 至少一次破坏性恢复演练并产出 RTO 报告。
+5. 文档包含配置说明、恢复步骤、审计项与已知限制。
