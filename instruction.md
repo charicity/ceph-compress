@@ -581,3 +581,61 @@ MVP 必须同时满足：
 
 **留档位置：**
 - `doc/wal/pr4-observability-validation.rst`（附录：审查后加固）
+
+### 12.11 PR-5 当前进度（2026-03-04）
+
+已完成 PR-5：WAL 全量回放工具（MVP）。
+
+**已落地内容：**
+- 新增独立 C++ 工具 `src/tools/ceph_bluestore_wal_replay.cc`（~800 行），
+  支持 scan/validate/open/replay/checkpoint/flush 完整流程。
+- 复用 RocksDB 原有逻辑：`log::Reader`（WAL 解析）、`WriteBatchInternal::SetContents`（batch 重建）、
+  `db->Write(disableWAL=true)`（写入），未重新实现 WAL 格式解析。
+- 新增 `WalBypassUtil.h` 共享头文件，提取文件名工具函数供捕获器与回放工具共用。
+- 在 `WalBypassCapture.cpp` 中新增：
+  - `notify_new_wal()`：WAL 文件轮转时写入 32KB 零填充，确保 `log::Reader` 块对齐。
+  - `persist_sharding_meta()`：将 `bluestore_rocksdb_cfs` 持久化到旁路目录。
+- 在 `BlueRocksEnv.cc` 中新 WAL 文件构造时调用 `notify_new_wal()`。
+- 在 `RocksDBStore.h` 中新增 `get_raw_db()` 公开只读访问器。
+- 新增 `qa/standalone/test-wal-replay.sh` 端到端测试脚本（5 项测试）。
+
+**工具使用方法：**
+
+```bash
+# 构建
+cd build && ninja ceph-bluestore-wal-replay
+
+# 验证模式（只检查不写 DB）
+bin/ceph-bluestore-wal-replay --wal-dir /path/to/bypass --verify-only
+
+# POSIX 全量回放
+bin/ceph-bluestore-wal-replay --wal-dir /path/to/bypass --mode posix --db-path /tmp/recovered_db
+
+# 定点恢复（到指定序号停止）
+bin/ceph-bluestore-wal-replay --wal-dir /path/to/bypass --mode posix --db-path /tmp/recovered_db --stop-seqno 50000
+
+# 断点续跑
+bin/ceph-bluestore-wal-replay --wal-dir /path/to/bypass --mode posix --db-path /tmp/recovered_db --checkpoint-file /tmp/recovered_db/replay.ckpt
+```
+
+**遇到的关键问题与解决方案（摘要）：**
+1. RocksDB 内部头文件需先于 Ceph 头文件包含，且需定义 `ROCKSDB_PLATFORM_POSIX`，否则 `port::` 命名空间和 `CACHE_LINE_SIZE` 宏冲突。
+2. `RocksDBStore::db` 为私有成员，通过新增 `get_raw_db()` 公开访问器解决。
+3. 重复回放已存在的 DB 时需检测 `CURRENT` 文件，调用 `open()` 而非 `create_and_open()`。
+
+**测试验证：**
+- 回归测试（`test-wal-bypass.sh`）：全部 8 项通过，确认旁路捕获不受影响。
+- 回放测试（`test-wal-replay.sh`）：全部 5 项通过：
+  - TEST A：verify-only 模式 — 1103 batches 扫描成功
+  - TEST B：POSIX 全量回放 — 1103 batches 应用，生成 9 个 RocksDB 文件
+  - TEST C：checkpoint 断点续跑 — stop-seqno=100 正确停止，检查点已写入
+  - TEST D：序列号间隙检测 — 正确报错 "sequence gap detected"
+  - TEST E：幂等回放 — 二次回放同一 DB 成功
+
+**留档位置：**
+- `doc/wal/pr5-replay-tool.rst`
+
+### 12.12 下一步建议（更新）
+
+- 进入 PR-6：端到端灾备演练脚本（mkfs + replay + OSD 启动 + 健康检查）。
+- 进入 PR-7：增强回放审计（区分零填充与真实损坏、逐文件统计）。
