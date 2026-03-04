@@ -425,4 +425,58 @@ MVP 必须同时满足：
 ### 12.7 下一步建议（更新）
 
 - 进入 PR-4：补齐可观测性与告警指标（旁路吞吐、积压、错误计数、回放进度）。
-- 补一轮更长 soak（30~60 分钟）作为回归基线，形成可复用稳定性曲线。
+
+### 12.8 PR-4 当前进度（2026-03-04）
+
+已完成 PR-4：监控与告警可观测性。
+
+**已落地内容：**
+- 在 `src/os/bluestore/BlueStore.h` 新增 WAL 旁路相关 perf 项：
+  - `l_bluestore_wal_bypass_bytes_total`
+  - `l_bluestore_wal_bypass_files_total`
+  - `l_bluestore_wal_bypass_flush_latency`
+  - `l_bluestore_wal_bypass_backlog_bytes`
+  - `l_bluestore_wal_bypass_write_errors_total`
+- 在 `src/os/bluestore/BlueStore.cc::_init_logger()` 注册对应字段：
+  - `wal_bypass_bytes_total`
+  - `wal_bypass_files_total`
+  - `wal_bypass_flush_latency`
+  - `wal_bypass_backlog_bytes`
+  - `wal_bypass_write_errors_total`
+- 在 `src/os/bluestore/BlueRocksEnv.{h,cc}` 透传 `BlueStore::logger` 到 `WalBypassCapture`。
+- 在 `src/os/bluestore/WalBypassCapture.{hpp,cpp}` 增加实时打点：
+  - 成功 flush 后累加 bytes；
+  - 新旁路文件打开时累加 files；
+  - flush 写入路径记录 latency；
+  - 前台/后台缓冲变化时更新 backlog；
+  - 写入/轮转失败时累加 errors。
+
+**构建验证：**
+- 增量构建通过：`cd build && ninja -j3 ceph-osd`。
+
+**留档位置：**
+- `doc/wal/pr4-observability-validation.rst`
+
+### 12.9 PR-4 在线验证结果（2026-03-04，3 OSD 短压）
+
+已按 3 OSD 场景完成在线验证（不含长压）。
+
+**执行形态：**
+- 冷启动后以 `MON=1 OSD=3 MGR=1` 拉起集群；
+- 启动时注入 `bluerocks_wal_bypass_*` 配置；
+- `rados bench 12s write -b 4096` 触发 WAL 写入；
+- 分别读取 `osd.0~2` 的 `perf dump` 新增字段。
+
+**关键结果：**
+- 集群状态：`HEALTH_OK`，`3 up / 3 in`；
+- 压测结果：`Bandwidth=3.47814 MB/s`，`IOPS=890`，`Avg Latency=0.0179568 s`；
+- 三个 OSD 上新增指标均可见且行为符合预期：
+  - `wal_bypass_bytes_total` 均约 75MB 并持续增长；
+  - `wal_bypass_files_total` 为 16~17；
+  - `wal_bypass_flush_latency` 有效（`avgcount` 约 1.4 万，`avgtime` 约 `2e-05`）；
+  - `wal_bypass_backlog_bytes=0`（采样点空闲）；
+  - `wal_bypass_write_errors_total=0`；
+- `/tmp/wal_bypass_pr4` 下可见连续命名的 `ceph_wal_*.log` 文件。
+
+**结论：**
+- PR-4 可观测性链路在 3 OSD 在线场景验证通过。
