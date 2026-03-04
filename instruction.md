@@ -480,3 +480,104 @@ MVP 必须同时满足：
 
 **结论：**
 - PR-4 可观测性链路在 3 OSD 在线场景验证通过。
+
+### 12.10 代码审查与缺陷修复（2026-03-04）
+
+对 PR-1 至 PR-4 落地代码进行全量审查，发现并修复了以下问题：
+
+#### P0 级（严重）
+
+1. **`flush_loop` 持锁做磁盘 I/O**
+   - 原实现 `flush_loop()` 整个循环持有 `m_lock`，包括 `write()`、`rotate_stream()`、`drain_old_streams()` 等 I/O 操作。
+   - 直接违反"前台线程只做内存拷贝，不等待磁盘"的核心设计约束。
+   - **修复**：`dequeue_flush` 拿到数据后释放锁→无锁完成磁盘 I/O→加锁更新状态。
+
+2. **`m_enabled`/`m_failed` 无锁访问导致数据竞争**
+   - `append()` 在加锁前读取 `m_enabled`、`m_failed`，而后台线程持锁写入。
+   - 属于 C++ 标准下 undefined behavior。
+   - **修复**：`m_enabled` 和 `m_failed` 改为 `std::atomic<bool>`。
+
+3. **backlog 无上限可导致 OOM**
+   - 如果旁路盘持续慢于 WAL 产生速率，`m_flush_buffer` 会通过 `append()` 无限膨胀。
+   - **修复**：新增配置项 `bluerocks_wal_max_backlog_mb`（默认 256MB）；
+     超限时丢弃数据并累加 `wal_bypass_drops_total` 计数器。
+
+#### P1 级（中等）
+
+4. **每个 WAL 文件独立创建旁路器实例**
+   - 原设计在 `BlueRocksWritableFile` 中 `make_unique<WalBypassCapture>`，
+     RocksDB WAL 轮转时频繁创建/销毁后台线程与序号状态。
+   - **修复**：将 `WalBypassCapture` 提升到 `BlueRocksEnv` 级别，所有 `WritableFile` 共享同一实例。
+
+5. **`persist_state_file` 和旁路文件缺少 fsync**
+   - `rename` 后未 `fsync` 目录，崩溃后目录项可能丢失。
+   - `std::ofstream::flush()` 仅保证数据到 kernel buffer，不保证落盘。
+   - **修复**：新增 POSIX fsync 辅助函数；
+     `persist_state_file` 在 `rename` 后 `fsync` 目录；
+     `WalBypassCaptureStream` 改用 POSIX fd 写入，`sync_and_close()` 调用 `fdatasync` + `fsync` 目录。
+
+6. **配置项标记 `runtime` 但实际无热更新**
+   - 所有 `bluerocks_wal_*` 配置在 WAL 文件打开时一次性读取，运行时修改不生效。
+   - **修复**：移除 `flags: runtime`；`handle_conf_change` 改为输出"需重启 OSD 生效"日志。
+
+#### P2 级（轻微）
+
+7. **`is_wal_file` 仅检查 `.log` 后缀，过于宽泛**
+   - 可能匹配 `OPTIONS-*.log` 等非 WAL 文件。
+   - **修复**：增加数字前缀校验，确保 basename 为纯数字 + `.log`。
+
+8. **`scan_max_bypass_seq` 中 `directory_iterator` 错误处理不完整**
+   - range-for 迭代过程中的错误不会更新 `ec`，可能抛异常。
+   - **修复**：改用 `it.increment(ec)` 显式迭代。
+
+9. **`#define dout_context nullptr` 无实际用途**
+   - 文件中所有日志均使用 `ldout(m_cct, ...)`，未用到 `dout` 宏。
+   - **修复**：移除多余的 `#define dout_context nullptr`。
+
+10. **`fsync_fd` 定义未使用**
+    - 构建产生 `-Wunused-function` 警告。
+    - **修复**：移除该函数。
+
+#### 涉及文件清单
+
+| 文件 | 变更类型 |
+|------|----------|
+| `src/os/bluestore/WalBypassCapture.cpp` | 重写核心：无锁 I/O、atomic 状态、backlog 上限、fd-based 写入、fsync |
+| `src/os/bluestore/WalBypassCapture.hpp` | 无变化 |
+| `src/os/bluestore/BlueRocksEnv.h` | 新增 `m_wal_bypass` 成员、`get_wal_bypass()` 接口 |
+| `src/os/bluestore/BlueRocksEnv.cc` | 修复 `is_wal_file`、共享旁路实例、`WritableFile` 用裸指针 |
+| `src/os/bluestore/BlueStore.h` | 新增 `l_bluestore_wal_bypass_drops_total` 枚举值 |
+| `src/os/bluestore/BlueStore.cc` | 注册 drops 计数器、tracked keys 增加 `bluerocks_wal_max_backlog_mb`、conf change 日志 |
+| `src/common/options/global.yaml.in` | 新增 `bluerocks_wal_max_backlog_mb`、移除所有 `flags: runtime` |
+| `qa/standalone/test-wal-bypass.sh` | 新增端到端冒烟测试脚本 |
+
+#### 新增配置项
+
+- `bluerocks_wal_max_backlog_mb`（uint，默认 256，最小 1）：
+  旁路缓冲积压超过此阈值时丢弃数据，防止 OOM。
+
+#### 新增 perf 计数器
+
+- `wal_bypass_drops_total`：因背压超限而丢弃的数据次数。
+
+#### 构建验证
+
+- `ninja -j3 ceph-osd` 通过，0 warning 0 error。
+
+#### 冒烟测试验证
+
+- 新增脚本 `qa/standalone/test-wal-bypass.sh`，自动执行：
+  1. 关闭旧集群 → 清理 dev/out → 创建旁路目录
+  2. 以 1 OSD 拉起集群（注入旁路配置）
+  3. `rados bench 10s write -b 4096`
+  4. 检查 perf 计数器
+  5. 关闭集群
+  6. 验证旁路文件：数量、序号连续性、state 文件一致性
+- 测试结果（全部 8 项通过）：
+  - 27 个旁路文件，序号 1..27 严格连续；
+  - state 文件值 28 = last_seq + 1；
+  - 74MB 旁路数据，perf 计数器一致；
+  - 0 写入错误，0 数据丢弃。
+
+**留档位置：**
+- `doc/wal/pr4-observability-validation.rst`（附录：审查后加固）

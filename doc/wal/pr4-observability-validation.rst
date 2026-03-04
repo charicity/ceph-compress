@@ -102,3 +102,86 @@ PR-4 为 BlueStore 的 WAL 旁路捕获链路新增了 perf 计数器，
 - ``wal_bypass_flush_latency`` 统计有效；
 - ``wal_bypass_write_errors_total`` 保持 0；
 - 旁路目录持续生成 ``ceph_wal_<seq>.log`` 文件。
+
+附录：代码审查后加固（2026-03-04）
+===================================
+
+对 PR-1 至 PR-4 进行全量代码审查后，完成以下加固修复。
+
+P0 修复
+-------
+
+1. **flush_loop 持锁做 I/O → 释放锁后执行磁盘操作**
+
+   原 ``flush_loop()`` 在整个循环中持有 ``m_lock``，
+   导致前台 ``append()`` 在旁路盘 I/O 期间被阻塞。
+   修复后：dequeue 数据 → 释放锁 → 写入 / 轮转 → 重新加锁更新状态。
+
+2. **m_enabled / m_failed 无锁读取 → 改为 std::atomic<bool>**
+
+   消除了 ``append()`` 路径上的 data race (UB)。
+
+3. **backlog 无上限 → 新增 bluerocks_wal_max_backlog_mb**
+
+   积压超限时丢弃数据并累加 ``wal_bypass_drops_total`` 计数器，
+   防止旁路盘慢时导致 OOM。
+
+P1 修复
+-------
+
+4. **每个 WAL 文件一个旁路器实例 → 提升到 BlueRocksEnv 级别共享**
+
+   ``WalBypassCapture`` 生命周期绑定到 ``BlueRocksEnv``，
+   所有 ``BlueRocksWritableFile`` 共享同一实例，
+   避免 RocksDB WAL 轮转时频繁创建/销毁后台线程。
+
+5. **state 文件和旁路文件缺少 fsync → 新增 POSIX fsync 辅助函数**
+
+   - ``persist_state_file()``：rename 后 ``fsync`` 目录。
+   - ``WalBypassCaptureStream``：改用 POSIX fd 写入，
+     ``sync_and_close()`` 调用 ``fdatasync`` + ``fsync`` 目录。
+
+6. **配置项 runtime 标志无效 → 移除 flags: runtime**
+
+   ``handle_conf_change`` 改为输出"需重启 OSD 生效"日志。
+
+P2 修复
+-------
+
+7. ``is_wal_file()`` 增加数字前缀校验，排除 ``OPTIONS-*.log`` 等。
+8. ``scan_max_bypass_seq()`` 改用 ``it.increment(ec)`` 显式迭代。
+9. 移除无用的 ``#define dout_context nullptr``。
+10. 移除未使用的 ``fsync_fd()`` 消除编译警告。
+
+新增配置与计数器
+----------------
+
+- ``bluerocks_wal_max_backlog_mb``（uint，默认 256，最小 1）
+- ``wal_bypass_drops_total``（uint64 counter）
+
+冒烟测试脚本
+------------
+
+新增 ``qa/standalone/test-wal-bypass.sh``：
+
+.. code-block:: bash
+
+   cd build
+   bash ../qa/standalone/test-wal-bypass.sh [BENCH_SECONDS]
+
+自动执行：停集群 → 清数据 → 拉起 1 OSD → 压测 → 关集群 → 验证旁路文件。
+
+验证结果（1 OSD，10s 短压）：
+
+.. code-block:: text
+
+   [PASS]  WAL bypass log files found (27 files)
+   [PASS]  Sequence state file exists
+   [PASS]  Bypass files contain data (74123735 bytes)
+   [PASS]  Perf counter wal_bypass_bytes_total > 0 (74118324)
+   [PASS]  No write errors reported
+   [PASS]  No data drops reported
+   [PASS]  Sequence numbers continuous: 1..27 (27 files)
+   [PASS]  State file value (28) == last_seq+1 (28)
+
+   ========== ALL CHECKS PASSED ==========
