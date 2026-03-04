@@ -243,6 +243,7 @@ enum {
   l_bluestore_wal_bypass_flush_latency,
   l_bluestore_wal_bypass_backlog_bytes,
   l_bluestore_wal_bypass_write_errors_total,
+  l_bluestore_wal_bypass_drops_total,
   //****************************************
   l_bluestore_last
 };

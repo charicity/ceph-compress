@@ -5836,7 +5836,8 @@ std::vector<std::string> BlueStore::get_tracked_keys() const noexcept
     "bluerocks_wal_rotate_size_mb"s,
     "bluerocks_wal_rotate_interval_sec"s,
     "bluerocks_wal_flush_trigger_kb"s,
-    "bluerocks_wal_flush_interval_ms"s
+    "bluerocks_wal_flush_interval_ms"s,
+    "bluerocks_wal_max_backlog_mb"s
   };
 }
 
@@ -5921,8 +5922,10 @@ void BlueStore::handle_conf_change(const ConfigProxy& conf,
       changed.count("bluerocks_wal_rotate_size_mb") ||
       changed.count("bluerocks_wal_rotate_interval_sec") ||
       changed.count("bluerocks_wal_flush_trigger_kb") ||
-      changed.count("bluerocks_wal_flush_interval_ms")) {
-    dout(10) << __func__ << " observed bluerocks wal bypass config change (skeleton only)" << dendl;
+      changed.count("bluerocks_wal_flush_interval_ms") ||
+      changed.count("bluerocks_wal_max_backlog_mb")) {
+    dout(1) << __func__ << " bluerocks wal bypass config changed;"
+            << " requires OSD restart to take effect" << dendl;
   }
 }
 
@@ -6634,6 +6637,11 @@ void BlueStore::_init_logger()
     "wal_bypass_write_errors_total",
     "Total wal bypass write or rotation errors",
     "wber",
+    PerfCountersBuilder::PRIO_USEFUL);
+  b.add_u64_counter(l_bluestore_wal_bypass_drops_total,
+    "wal_bypass_drops_total",
+    "Total wal bypass data drops due to backlog overflow",
+    "wbdr",
     PerfCountersBuilder::PRIO_USEFUL);
 
   // Resulting size axis configuration for op histograms, values are in bytes

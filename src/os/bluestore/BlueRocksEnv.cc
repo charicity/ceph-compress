@@ -179,11 +179,29 @@ class BlueRocksRandomAccessFile : public rocksdb::RandomAccessFile {
 
 bool is_wal_file(const std::string& fname)
 {
-  // 根据后缀判断是否是 wal
-  // 是否过于草率了
+  // RocksDB WAL files are named NNNNNN.log (pure numeric prefix + .log suffix).
+  // We must avoid matching OPTIONS-*.log, LOG, etc.
   constexpr std::string_view suffix = ".log";
-  return fname.size() >= suffix.size() &&
-    fname.compare(fname.size() - suffix.size(), suffix.size(), suffix) == 0;
+  if (fname.size() <= suffix.size()) {
+    return false;
+  }
+  if (fname.compare(fname.size() - suffix.size(), suffix.size(), suffix) != 0) {
+    return false;
+  }
+  // Extract the basename (after last '/')
+  size_t slash = fname.rfind('/');
+  size_t base_begin = (slash == std::string::npos) ? 0 : slash + 1;
+  size_t base_end = fname.size() - suffix.size();
+  if (base_begin >= base_end) {
+    return false;
+  }
+  // All characters in the basename (before .log) must be digits
+  for (size_t i = base_begin; i < base_end; ++i) {
+    if (fname[i] < '0' || fname[i] > '9') {
+      return false;
+    }
+  }
+  return true;
 }
 
 // A file abstraction for sequential writing.  The implementation
@@ -192,18 +210,17 @@ bool is_wal_file(const std::string& fname)
 class BlueRocksWritableFile : public rocksdb::WritableFile {
   BlueFS *fs;
   BlueFS::FileWriter *h;
-  std::unique_ptr<WalBypassCapture> wal_bypass;
+  WalBypassCapture* wal_bypass;  // owned by BlueRocksEnv, not by us
  public:
   BlueRocksWritableFile(BlueFS *fs,
                         BlueFS::FileWriter *h,
                         const std::string& fname,
-                        ceph::common::PerfCounters* bluestore_logger,
+                        WalBypassCapture* bypass,
                         bool may_be_wal)
-    : fs(fs), h(h)
+    : fs(fs), h(h), wal_bypass(nullptr)
   {
-    // may_be_wal 有点蠢，但是确实很有必要
-    if (may_be_wal && is_wal_file(fname)) {
-      wal_bypass = std::make_unique<WalBypassCapture>(fs->cct, bluestore_logger);
+    if (may_be_wal && bypass && is_wal_file(fname)) {
+      wal_bypass = bypass;
     }
   }
   ~BlueRocksWritableFile() override {
@@ -364,9 +381,9 @@ class BlueRocksFileLock : public rocksdb::FileLock {
 BlueRocksEnv::BlueRocksEnv(BlueFS *f, ceph::common::PerfCounters* logger)
   : EnvWrapper(Env::Default()),  // forward most of it to POSIX
     fs(f),
-    bluestore_logger(logger)
+    bluestore_logger(logger),
+    m_wal_bypass(std::make_unique<WalBypassCapture>(f->cct, logger))
 {
-
 }
 
 rocksdb::Status BlueRocksEnv::NewSequentialFile(
@@ -409,7 +426,7 @@ rocksdb::Status BlueRocksEnv::NewWritableFile(
   int r = fs->open_for_write(dir, file, &h, false);
   if (r < 0)
     return err_to_status(r);
-  result->reset(new BlueRocksWritableFile(fs, h, fname, bluestore_logger, true));
+  result->reset(new BlueRocksWritableFile(fs, h, fname, m_wal_bypass.get(), true));
   return rocksdb::Status::OK();
 }
 
@@ -430,7 +447,7 @@ rocksdb::Status BlueRocksEnv::ReuseWritableFile(
   r = fs->open_for_write(new_dir, new_file, &h, true);
   if (r < 0)
     return err_to_status(r);
-  result->reset(new BlueRocksWritableFile(fs, h, new_fname, bluestore_logger, true));
+  result->reset(new BlueRocksWritableFile(fs, h, new_fname, m_wal_bypass.get(), true));
   fs->sync_metadata(false);
   return rocksdb::Status::OK();
 }

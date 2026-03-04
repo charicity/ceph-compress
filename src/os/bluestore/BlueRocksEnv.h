@@ -15,6 +15,7 @@
 #include "kv/RocksDBStore.h"
 
 class BlueFS;
+class WalBypassCapture;
 
 class BlueRocksEnv : public rocksdb::EnvWrapper {
 public:
@@ -190,9 +191,12 @@ public:
 
   explicit BlueRocksEnv(BlueFS *f,
                         ceph::common::PerfCounters* bluestore_logger = nullptr);
+  WalBypassCapture* get_wal_bypass() const { return m_wal_bypass.get(); }
+
 private:
   BlueFS *fs;
   ceph::common::PerfCounters* bluestore_logger;
+  std::unique_ptr<WalBypassCapture> m_wal_bypass;
 };
 
 #endif

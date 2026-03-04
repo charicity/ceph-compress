@@ -4522,8 +4522,6 @@ options:
   default: false
   services:
   - osd
-  flags:
-  - runtime
   with_legacy: false
 - name: bluerocks_wal_bypass_dir
   type: str
@@ -4533,8 +4531,6 @@ options:
   - osd
   see_also:
   - bluerocks_wal_bypass_enable
-  flags:
-  - runtime
   with_legacy: false
 - name: bluerocks_wal_rotate_size_mb
   type: uint
@@ -4547,8 +4543,6 @@ options:
   see_also:
   - bluerocks_wal_bypass_enable
   - bluerocks_wal_bypass_dir
-  flags:
-  - runtime
   with_legacy: false
 - name: bluerocks_wal_rotate_interval_sec
   type: uint
@@ -4561,8 +4555,6 @@ options:
   see_also:
   - bluerocks_wal_bypass_enable
   - bluerocks_wal_bypass_dir
-  flags:
-  - runtime
   with_legacy: false
 - name: bluerocks_wal_flush_trigger_kb
   type: uint
@@ -4574,8 +4566,6 @@ options:
   - osd
   see_also:
   - bluerocks_wal_bypass_enable
-  flags:
-  - runtime
   with_legacy: false
 - name: bluerocks_wal_flush_interval_ms
   type: uint
@@ -4587,8 +4577,17 @@ options:
   - osd
   see_also:
   - bluerocks_wal_bypass_enable
-  flags:
-  - runtime
+  with_legacy: false
+- name: bluerocks_wal_max_backlog_mb
+  type: uint
+  level: dev
+  desc: Maximum buffered backlog in MiB before bypass capture starts dropping data to prevent OOM
+  default: 256
+  min: 1
+  services:
+  - osd
+  see_also:
+  - bluerocks_wal_bypass_enable
   with_legacy: false
 - name: bluestore_bdev_label_multi
   type: bool

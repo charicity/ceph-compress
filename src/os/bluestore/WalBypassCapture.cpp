@@ -7,28 +7,61 @@
 #include "common/ceph_context.h"
 #include "common/ceph_time.h"
 #include "common/debug.h"
+#include "common/errno.h"
 #include "common/perf_counters.h"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
-#include <deque>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
-#define dout_context nullptr
 #define dout_subsys ceph_subsys_bluestore
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// POSIX fsync helpers
+// ---------------------------------------------------------------------------
+
+int fsync_path(const fs::path& p)
+{
+  int fd = ::open(p.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return -errno;
+  }
+  int r = ::fdatasync(fd);
+  int save = errno;
+  ::close(fd);
+  return r < 0 ? -save : 0;
+}
+
+int fsync_directory(const fs::path& dir)
+{
+  int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+  if (fd < 0) {
+    return -errno;
+  }
+  int r = ::fsync(fd);
+  int save = errno;
+  ::close(fd);
+  return r < 0 ? -save : 0;
+}
+
+// ---------------------------------------------------------------------------
 
 std::string make_wal_bypass_filename(uint64_t seq)
 {
@@ -185,12 +218,27 @@ private:
       }
     }
 
+    // fsync the tmp file content before rename
+    if (int r = fsync_path(tmp); r < 0) {
+      lderr(m_cct) << __func__ << " failed to fsync tmp state file " << tmp
+                   << " r=" << r << dendl;
+      fs::remove(tmp, ec);
+      return false;
+    }
+
     fs::rename(tmp, m_state_path, ec);
     if (ec) {
       fs::remove(tmp, ec);
       lderr(m_cct) << __func__ << " failed to rename " << tmp << " to "
                    << m_state_path << " ec=" << ec.message() << dendl;
       return false;
+    }
+
+    // fsync directory to persist the rename (directory entry)
+    if (int r = fsync_directory(m_dir); r < 0) {
+      lderr(m_cct) << __func__ << " failed to fsync dir " << m_dir
+                   << " after rename, r=" << r << dendl;
+      // non-fatal: data is written, rename done, just dir entry may not be durable
     }
     return true;
   }
@@ -227,12 +275,19 @@ private:
     }
 
     uint64_t max_seq = 0;
-    for (const auto& entry : fs::directory_iterator(m_dir, ec)) {
-      if (ec || !entry.is_regular_file()) {
+    auto it = fs::directory_iterator(m_dir, ec);
+    if (ec) {
+      return 0;
+    }
+    for (auto end = fs::directory_iterator(); it != end; it.increment(ec)) {
+      if (ec) {
+        break;
+      }
+      if (!it->is_regular_file(ec) || ec) {
         continue;
       }
       uint64_t seq = 0;
-      if (parse_wal_bypass_seq(entry.path().filename().string(), seq) &&
+      if (parse_wal_bypass_seq(it->path().filename().string(), seq) &&
           seq > max_seq) {
         max_seq = seq;
       }
@@ -248,7 +303,7 @@ private:
   fs::path m_path;
   uint64_t m_seq;
   bool m_path_exists = false;
-  std::ofstream m_out;
+  int m_fd = -1;
   uint64_t m_bytes_written = 0;
   bool m_flush_pending = false;
   std::string m_active_buffer;
@@ -267,48 +322,61 @@ public:
   }
 
   ~WalBypassCaptureStream() {
-    if (m_out.is_open()) {
-      m_out.close();
+    if (m_fd >= 0) {
+      ::close(m_fd);
+      m_fd = -1;
     }
   }
 
   bool open() {
-    std::error_code ec;
-    if (fs::exists(m_path, ec) && !ec) {
-      m_path_exists = true;
-      ldout(m_cct, 15) << __func__ << " path exists: " << m_path << dendl;
-      return false;
-    }
-
-    m_out.open(m_path, std::ios::out | std::ios::binary | std::ios::trunc);
-    if (!m_out.is_open()) {
+    // O_CREAT|O_EXCL provides atomic "create if not exists"
+    m_fd = ::open(m_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, 0644);
+    if (m_fd < 0) {
+      if (errno == EEXIST) {
+        m_path_exists = true;
+        ldout(m_cct, 15) << __func__ << " path exists: " << m_path << dendl;
+        return false;
+      }
       lderr(m_cct) << __func__ << " failed to open bypass log: "
-                   << m_path << dendl;
+                   << m_path << " errno=" << cpp_strerror(errno) << dendl;
       return false;
     }
 
     m_path_exists = false;
     m_bytes_written = 0;
     m_opened_at = std::chrono::steady_clock::now();
+
+    // fsync directory to persist the new directory entry
+    fsync_directory(m_dir);
+
     ldout(m_cct, 15) << __func__ << " opened stream seq=" << m_seq
                      << " path=" << m_path << dendl;
     return true;
   }
 
+  // write() is ONLY called by the worker thread (no lock needed for fd access)
   bool write(const char* data, size_t len) {
-    if (!m_out.is_open()) {
+    if (m_fd < 0) {
       return false;
     }
-    m_out.write(data, len);
-    if (!m_out.good()) {
-      lderr(m_cct) << __func__ << " failed writing bypass log: "
-                   << m_path << dendl;
-      return false;
+    while (len > 0) {
+      ssize_t r = ::write(m_fd, data, len);
+      if (r < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        lderr(m_cct) << __func__ << " failed writing bypass log: "
+                     << m_path << " errno=" << cpp_strerror(errno) << dendl;
+        return false;
+      }
+      data += r;
+      len -= static_cast<size_t>(r);
+      m_bytes_written += static_cast<uint64_t>(r);
     }
-    m_bytes_written += len;
     return true;
   }
 
+  // append_to_active is called under m_lock by the front-end thread
   void append_to_active(const char* data, size_t len) {
     m_active_buffer.append(data, len);
   }
@@ -353,17 +421,20 @@ public:
   }
 
   bool sync_and_close() {
-    if (!m_out.is_open()) {
+    if (m_fd < 0) {
       return true;
     }
 
-    m_out.flush();
-    if (!m_out.good()) {
-      lderr(m_cct) << __func__ << " failed flushing bypass log: "
-                   << m_path << dendl;
+    int r = ::fdatasync(m_fd);
+    if (r < 0) {
+      lderr(m_cct) << __func__ << " failed fdatasync bypass log: "
+                   << m_path << " errno=" << cpp_strerror(errno) << dendl;
+      ::close(m_fd);
+      m_fd = -1;
       return false;
     }
-    m_out.close();
+    ::close(m_fd);
+    m_fd = -1;
     return true;
   }
 
@@ -428,17 +499,28 @@ class WalBypassCapture::Impl {
 private:
   CephContext* m_cct;
   ceph::common::PerfCounters* m_logger = nullptr;
-  bool m_enabled = false;
-  bool m_stopping = false;
-  bool m_failed = false;
+
+  // Atomic flags: read by front-end without lock, written by worker/shutdown.
+  std::atomic<bool> m_enabled{false};
+  std::atomic<bool> m_failed{false};
+
+  bool m_stopping = false;  // only under m_lock
   uint64_t m_flush_trigger_bytes = 1024 * 1024;
+  uint64_t m_max_backlog_bytes = 256ULL * 1024 * 1024;
   std::chrono::milliseconds m_flush_interval = std::chrono::milliseconds(100);
   std::unique_ptr<WalBypassRotatePolicy> m_rotate_policy;
   std::chrono::steady_clock::time_point m_last_enqueue = std::chrono::steady_clock::now();
   fs::path m_bypass_dir;
+
+  // m_seq_state is ONLY accessed by the worker thread (and during init/shutdown
+  // when worker is not running). No lock needed.
   std::unique_ptr<WalBypassSeqState> m_seq_state;
+
+  // m_current_stream pointer: modified under m_lock.
+  // write()/sync_and_close() on the stream: ONLY called by worker thread.
+  // active_buffer operations: called under m_lock by front-end.
   std::unique_ptr<WalBypassCaptureStream> m_current_stream;
-  std::deque<std::unique_ptr<WalBypassCaptureStream>> m_old_streams;
+
   std::mutex m_lock;
   std::condition_variable m_cond;
   std::thread m_worker;
@@ -470,6 +552,11 @@ public:
       return;
     }
 
+    uint64_t max_backlog_mb = m_cct->_conf.get_val<uint64_t>("bluerocks_wal_max_backlog_mb");
+    if (max_backlog_mb > 0) {
+      m_max_backlog_bytes = max_backlog_mb * 1024ULL * 1024ULL;
+    }
+
     m_flush_trigger_bytes = trigger_kb * 1024;
     m_flush_interval = std::chrono::milliseconds(interval_ms);
     m_rotate_policy = std::make_unique<WalBypassRotatePolicy>(
@@ -493,13 +580,20 @@ public:
       return;
     }
 
-    if (!open_next_stream()) {
-      lderr(m_cct) << __func__ << " failed to open initial bypass stream"
-                   << dendl;
-      return;
+    {
+      // open_next_stream sets m_current_stream; safe without lock since
+      // worker thread is not started yet.
+      auto stream = try_create_stream();
+      if (!stream) {
+        lderr(m_cct) << __func__ << " failed to open initial bypass stream"
+                     << dendl;
+        return;
+      }
+      m_current_stream = std::move(stream);
+      on_file_opened();
     }
 
-    m_enabled = true;
+    m_enabled.store(true, std::memory_order_release);
     m_worker = std::thread(&Impl::flush_loop, this);
   }
 
@@ -508,16 +602,34 @@ public:
   }
 
   bool enabled() const {
-    return m_enabled;
+    return m_enabled.load(std::memory_order_acquire);
   }
 
   void append(const char* data, size_t len) {
-    if (!m_enabled || m_failed || len == 0 || !m_current_stream) {
+    if (!m_enabled.load(std::memory_order_acquire) ||
+        m_failed.load(std::memory_order_acquire) ||
+        len == 0) {
       return;
     }
 
     auto now = std::chrono::steady_clock::now();
     std::unique_lock lk(m_lock);
+
+    if (!m_current_stream) {
+      // During rotation window, silently drop.
+      // This window is very short (sub-ms on healthy disks).
+      return;
+    }
+
+    // Backlog limit check: reject new data when backlog exceeds threshold
+    // to prevent OOM if the bypass disk is slower than WAL production rate.
+    const uint64_t current_backlog = m_current_stream->active_size() +
+      m_current_stream->flush_size();
+    if (m_max_backlog_bytes > 0 && current_backlog + len > m_max_backlog_bytes) {
+      on_data_dropped(len);
+      return;
+    }
+
     m_current_stream->append_to_active(data, len);
     if (m_current_stream->active_size() >= m_flush_trigger_bytes ||
         now - m_last_enqueue >= m_flush_interval) {
@@ -545,17 +657,13 @@ private:
     return m_current_stream && m_current_stream->has_active_buffer();
   }
 
-  bool write_to_current_stream(const char* data, size_t len) {
-    if (!m_current_stream) {
-      return false;
-    }
-    return m_current_stream->write(data, len);
-  }
-
-  bool open_next_stream() {
+  // Create a new bypass stream file. Only called by worker thread
+  // (or during init when worker is not running).
+  // Does NOT modify m_current_stream — caller assigns the result.
+  std::unique_ptr<WalBypassCaptureStream> try_create_stream() {
     if (!m_seq_state || !m_seq_state->ensure_consistent_with_disk()) {
       lderr(m_cct) << __func__ << " sequence state inconsistent" << dendl;
-      return false;
+      return nullptr;
     }
 
     for (int attempt = 0; attempt < 1024; ++attempt) {
@@ -568,7 +676,7 @@ private:
           continue;
         }
         on_write_error();
-        return false;
+        return nullptr;
       }
 
       if (!m_seq_state->commit_opened_seq(stream->seq())) {
@@ -576,100 +684,141 @@ private:
         lderr(m_cct) << __func__ << " failed to commit opened seq="
                      << stream->seq() << dendl;
         on_write_error();
-        return false;
+        return nullptr;
       }
-      m_current_stream = std::move(stream);
-      on_file_opened();
-      return true;
+      return stream;
     }
     lderr(m_cct) << __func__ << " exhausted retries while opening new stream"
                  << dendl;
-    return false;
+    return nullptr;
   }
 
-  bool rotate_stream() {
-    if (!m_current_stream) {
-      return false;
+  // Rotate stream. Called by worker thread only.
+  // The lock is NOT held on entry. We acquire/release it for pointer swaps
+  // but do all file I/O without the lock.
+  bool rotate_stream_unlocked() {
+    // Phase 1: Detach old stream under lock.
+    // While m_current_stream is null, front-end append() will silently drop.
+    std::unique_ptr<WalBypassCaptureStream> old_stream;
+    {
+      std::unique_lock lk(m_lock);
+      old_stream = std::move(m_current_stream);
+      // m_current_stream is now nullptr
     }
 
-    m_old_streams.push_back(std::move(m_current_stream));
-
-    if (!drain_old_streams()) {
-      lderr(m_cct) << __func__ << " failed draining old streams" << dendl;
-      return false;
-    }
-    if (!open_next_stream()) {
-      lderr(m_cct) << __func__ << " failed opening rotated stream" << dendl;
-      return false;
-    }
-    return true;
-  }
-
-  bool drain_old_streams() {
-    while (!m_old_streams.empty()) {
-      auto& old_stream = m_old_streams.front();
+    // Phase 2: Close old stream without lock (fdatasync + close).
+    if (old_stream) {
       if (!old_stream->sync_and_close()) {
-        lderr(m_cct) << __func__ << " failed to close old stream" << dendl;
+        lderr(m_cct) << __func__ << " failed closing old stream" << dendl;
+        // non-fatal for rotation; continue opening new stream
+      }
+      old_stream.reset();
+    }
+
+    // Phase 3: Open new stream without lock (file I/O).
+    auto new_stream = try_create_stream();
+
+    // Phase 4: Install new stream under lock.
+    {
+      std::unique_lock lk(m_lock);
+      if (new_stream) {
+        m_current_stream = std::move(new_stream);
+        on_file_opened();
+      } else {
+        lderr(m_cct) << __func__ << " failed opening rotated stream" << dendl;
+        m_failed.store(true, std::memory_order_release);
+        on_write_error();
         return false;
       }
-      m_old_streams.pop_front();
     }
     return true;
   }
 
+  // ---------------------------------------------------------------------------
+  // flush_loop: The worker thread.
+  //
+  // Design: The lock (m_lock) is ONLY held for buffer management (dequeue,
+  // enqueue, pointer swap). All file I/O (write, fsync, open, close) happens
+  // WITHOUT the lock, so the front-end append() is never blocked by disk I/O.
+  //
+  // Safety: m_current_stream->write() is only called by this thread.
+  // m_current_stream pointer is stable between lock acquisitions because
+  // only this thread (and shutdown after join) modifies it.
+  // ---------------------------------------------------------------------------
   void flush_loop() {
     std::string local;
 
-    // 锁的范围比较大，并且这个锁是在关键路径上的，所以需要尽量避免在持锁期间做过多的事情
-    // 目前 flush 的频率应该不会太高，所以应该不会有太大影响
-    std::unique_lock lk(m_lock);
     while (true) {
-      if (!has_flush_pending_locked()) {
-        m_cond.wait_for(lk, m_flush_interval, [this] {
-          return has_flush_pending_locked() || m_stopping;
-        });
-        if (!has_flush_pending_locked()) {
-          enqueue_flush_locked(std::chrono::steady_clock::now());
-        }
-      }
+      bool got_data = false;
 
-      if (m_current_stream && m_current_stream->dequeue_flush(&local)) {
-        if (!local.empty()) {
-          auto t0 = mono_clock::now();
-          const bool write_ok = write_to_current_stream(local.data(), local.size());
-          auto flush_lat = mono_clock::now() - t0;
-          on_flush_latency(flush_lat);
-          if (!write_ok) {
-            lderr(m_cct) << __func__ << " bypass write failed, disabling capture"
-                         << dendl;
-            m_failed = true;
-            on_write_error();
-          } else {
-            on_bytes_written(local.size());
-            if (m_rotate_policy &&
-                m_current_stream &&
-                m_rotate_policy->should_rotate(*m_current_stream) &&
-                !rotate_stream()) {
-              lderr(m_cct) << __func__ << " rotate failed, disabling capture"
-                           << dendl;
-              m_failed = true;
-              on_write_error();
-            }
+      // === Phase 1: Dequeue under lock ===
+      {
+        std::unique_lock lk(m_lock);
+        if (!has_flush_pending_locked()) {
+          m_cond.wait_for(lk, m_flush_interval, [this] {
+            return has_flush_pending_locked() || m_stopping;
+          });
+          if (!has_flush_pending_locked()) {
+            enqueue_flush_locked(std::chrono::steady_clock::now());
           }
         }
-        update_backlog_locked();
+
+        // Check for termination
+        if (m_stopping && !has_flush_pending_locked() && !has_active_buffer_locked()) {
+          update_backlog_locked();
+          break;
+        }
+
+        if (m_current_stream) {
+          got_data = m_current_stream->dequeue_flush(&local);
+        }
+      }
+      // Lock released — front-end append() can run freely now.
+
+      // === Phase 2: Write I/O without lock ===
+      // m_current_stream pointer is stable here: only this thread modifies it
+      // (via rotate_stream_unlocked), and we haven't rotated yet.
+      if (got_data && !local.empty() && m_current_stream) {
+        auto t0 = mono_clock::now();
+        const bool write_ok = m_current_stream->write(local.data(), local.size());
+        auto flush_lat = mono_clock::now() - t0;
+        on_flush_latency(flush_lat);
+
+        if (!write_ok) {
+          lderr(m_cct) << __func__ << " bypass write failed, disabling capture"
+                       << dendl;
+          m_failed.store(true, std::memory_order_release);
+          on_write_error();
+          local.clear();
+          continue;  // loop back to check m_stopping
+        }
+        on_bytes_written(local.size());
+        local.clear();
+
+        // === Phase 3: Check rotation without lock ===
+        // rotate policy + stream stats are read-only here; safe.
+        if (m_rotate_policy && m_current_stream &&
+            m_rotate_policy->should_rotate(*m_current_stream)) {
+          if (!rotate_stream_unlocked()) {
+            lderr(m_cct) << __func__ << " rotate failed, disabling capture"
+                         << dendl;
+            // m_failed already set by rotate_stream_unlocked
+          }
+        }
+      } else {
         local.clear();
       }
 
-      if (m_stopping && !has_flush_pending_locked() && !has_active_buffer_locked()) {
+      // === Phase 4: Update backlog under lock ===
+      {
+        std::unique_lock lk(m_lock);
         update_backlog_locked();
-        break;
       }
     }
   }
 
   void shutdown() {
-    if (!m_enabled) {
+    if (!m_enabled.load(std::memory_order_acquire)) {
       return;
     }
 
@@ -690,13 +839,10 @@ private:
       m_current_stream->sync_and_close();
       m_current_stream.reset();
     }
-    if (!m_old_streams.empty()) {
-      drain_old_streams();
-    }
     if (m_logger) {
       m_logger->set(l_bluestore_wal_bypass_backlog_bytes, 0);
     }
-    m_enabled = false;
+    m_enabled.store(false, std::memory_order_release);
   }
 
   void on_file_opened() {
@@ -717,6 +863,12 @@ private:
     }
   }
 
+  void on_data_dropped(size_t /* len */) {
+    if (m_logger) {
+      m_logger->inc(l_bluestore_wal_bypass_drops_total);
+    }
+  }
+
   void on_flush_latency(ceph::timespan lat) {
     if (m_logger) {
       m_logger->tinc_with_max(l_bluestore_wal_bypass_flush_latency, lat);
@@ -727,8 +879,6 @@ private:
     if (!m_logger || !m_current_stream) {
       return;
     }
-    // 理论上不是很准，因为 m_old_streams 里可能还有一些待 flush 的数据
-    // 但是这个值主要是为了监控和 alert 的，所以不需要非常精准
     const uint64_t backlog = m_current_stream->active_size() +
       m_current_stream->flush_size();
     m_logger->set(l_bluestore_wal_bypass_backlog_bytes, backlog);
