@@ -5,6 +5,7 @@ add_library(bluestore OBJECT
   BlueFS.cc
   bluefs_types.cc
   BlueRocksEnv.cc
+  WalBypassCapture.cpp
   BlueStore.cc
   BlueStore_debug.cc
   simple_bitmap.cc
@@ -33,7 +34,8 @@ endif()
 
 if(WITH_BLUEFS)
   add_library(bluefs SHARED
-    BlueRocksEnv.cc)
+    BlueRocksEnv.cc
+    WalBypassCapture.cpp)
   target_include_directories(bluefs SYSTEM PUBLIC
     $<TARGET_PROPERTY:RocksDB::RocksDB,INTERFACE_INCLUDE_DIRECTORIES>)
   target_link_libraries(bluefs global)
