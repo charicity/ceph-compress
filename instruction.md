@@ -230,7 +230,9 @@ MVP 必须同时满足：
 
 **改动文件（建议）**：
 - `src/os/bluestore/BlueRocksEnv.h`
-- `src/os/bluestore/BlueRocksEnv.cc`（`BlueRocksWritableFile::Append`）
+- `src/os/bluestore/BlueRocksEnv.cc`（`BlueRocksWritableFile::Append` 挂载点）
+- `src/os/bluestore/WalBypassCapture.hpp`
+- `src/os/bluestore/WalBypassCapture.cpp`
 
 **验收标准**：
 - 开关关闭时行为与基线一致；开启后旁路目录持续增长。
@@ -240,7 +242,9 @@ MVP 必须同时满足：
 **目标**：实现 size/time 轮转与重启后序号连续。
 
 **改动文件（建议）**：
-- `src/os/bluestore/BlueRocksEnv.cc`
+- `src/os/bluestore/WalBypassCapture.hpp`
+- `src/os/bluestore/WalBypassCapture.cpp`
+- `src/os/bluestore/BlueRocksEnv.cc`（引用/接入点）
 
 **验收标准**：
 - 高并发与频繁轮转下不丢失、不乱序、不重复序号。
@@ -373,7 +377,8 @@ MVP 必须同时满足：
 已完成 PR-2 最小实现与在线验证。
 
 **已落地内容：**
-- 在 `src/os/bluestore/BlueRocksEnv.cc` 增加 WAL 旁路器（双缓冲 + 后台线程）。
+- 当前实现位于 `src/os/bluestore/WalBypassCapture.cpp`
+  （由 `src/os/bluestore/BlueRocksEnv.cc` 的 `BlueRocksWritableFile::Append` 挂载调用）。
 - 在 `BlueRocksWritableFile::Append` 中实现 `.log` 文件旁路写入。
 - 保持主写路径不变：原 `append_try_flush` 逻辑未改语义。
 - 完成运行验证：旁路目录出现 `.bypass` 文件，压测期间字节持续增长。
@@ -389,7 +394,8 @@ MVP 必须同时满足：
 已完成 PR-3 的核心能力与补充稳定性回归。
 
 **已落地内容：**
-- 在 `src/os/bluestore/BlueRocksEnv.cc` 完成严格轮转与序号持久化链路验证：
+- 在 `src/os/bluestore/WalBypassCapture.cpp`
+  （由 `src/os/bluestore/BlueRocksEnv.cc` 引用）完成严格轮转与序号持久化链路验证：
   - 旁路文件按 `ceph_wal_<seq>.log` 严格递增；
   - `ceph_wal_seq.state` 与最大文件序号保持 `+1` 一致；
   - 支持按大小/时间触发轮转（本次重点验证 2 秒时间轮转）。
