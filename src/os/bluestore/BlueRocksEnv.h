@@ -188,9 +188,11 @@ public:
   rocksdb::Status GetAbsolutePath(const std::string& db_path,
       std::string* output_path) override;
 
-  explicit BlueRocksEnv(BlueFS *f);
+  explicit BlueRocksEnv(BlueFS *f,
+                        ceph::common::PerfCounters* bluestore_logger = nullptr);
 private:
   BlueFS *fs;
+  ceph::common::PerfCounters* bluestore_logger;
 };
 
 #endif

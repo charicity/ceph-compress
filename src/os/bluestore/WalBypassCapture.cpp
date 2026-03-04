@@ -3,8 +3,11 @@
 
 #include "WalBypassCapture.hpp"
 
+#include "BlueStore.h"
 #include "common/ceph_context.h"
+#include "common/ceph_time.h"
 #include "common/debug.h"
+#include "common/perf_counters.h"
 
 #include <cerrno>
 #include <chrono>
@@ -322,6 +325,10 @@ public:
     return m_flush_pending;
   }
 
+  size_t flush_size() const {
+    return m_flush_pending ? m_flush_buffer.size() : 0;
+  }
+
   void enqueue_flush() {
     if (m_active_buffer.empty()) {
       return;
@@ -420,6 +427,7 @@ public:
 class WalBypassCapture::Impl {
 private:
   CephContext* m_cct;
+  ceph::common::PerfCounters* m_logger = nullptr;
   bool m_enabled = false;
   bool m_stopping = false;
   bool m_failed = false;
@@ -436,8 +444,9 @@ private:
   std::thread m_worker;
 
 public:
-  explicit Impl(CephContext* cct)
-    : m_cct(cct) {
+  explicit Impl(CephContext* cct, ceph::common::PerfCounters* logger)
+    : m_cct(cct),
+      m_logger(logger) {
     if (!m_cct->_conf.get_val<bool>("bluerocks_wal_bypass_enable")) {
       return;
     }
@@ -514,6 +523,7 @@ public:
         now - m_last_enqueue >= m_flush_interval) {
       enqueue_flush_locked(now);
     }
+    update_backlog_locked();
   }
 
 private:
@@ -557,6 +567,7 @@ private:
           m_seq_state->on_file_exists_conflict();
           continue;
         }
+        on_write_error();
         return false;
       }
 
@@ -564,9 +575,11 @@ private:
         stream->sync_and_close();
         lderr(m_cct) << __func__ << " failed to commit opened seq="
                      << stream->seq() << dendl;
+        on_write_error();
         return false;
       }
       m_current_stream = std::move(stream);
+      on_file_opened();
       return true;
     }
     lderr(m_cct) << __func__ << " exhausted retries while opening new stream"
@@ -607,6 +620,8 @@ private:
   void flush_loop() {
     std::string local;
 
+    // 锁的范围比较大，并且这个锁是在关键路径上的，所以需要尽量避免在持锁期间做过多的事情
+    // 目前 flush 的频率应该不会太高，所以应该不会有太大影响
     std::unique_lock lk(m_lock);
     while (true) {
       if (!has_flush_pending_locked()) {
@@ -619,24 +634,35 @@ private:
       }
 
       if (m_current_stream && m_current_stream->dequeue_flush(&local)) {
-        if (!local.empty() && !write_to_current_stream(local.data(), local.size())) {
-          lderr(m_cct) << __func__ << " bypass write failed, disabling capture"
-                       << dendl;
-          m_failed = true;
-        } else if (!local.empty()) {
-          if (m_rotate_policy &&
-              m_current_stream &&
-              m_rotate_policy->should_rotate(*m_current_stream) &&
-              !rotate_stream()) {
-            lderr(m_cct) << __func__ << " rotate failed, disabling capture"
+        if (!local.empty()) {
+          auto t0 = mono_clock::now();
+          const bool write_ok = write_to_current_stream(local.data(), local.size());
+          auto flush_lat = mono_clock::now() - t0;
+          on_flush_latency(flush_lat);
+          if (!write_ok) {
+            lderr(m_cct) << __func__ << " bypass write failed, disabling capture"
                          << dendl;
             m_failed = true;
+            on_write_error();
+          } else {
+            on_bytes_written(local.size());
+            if (m_rotate_policy &&
+                m_current_stream &&
+                m_rotate_policy->should_rotate(*m_current_stream) &&
+                !rotate_stream()) {
+              lderr(m_cct) << __func__ << " rotate failed, disabling capture"
+                           << dendl;
+              m_failed = true;
+              on_write_error();
+            }
           }
         }
+        update_backlog_locked();
         local.clear();
       }
 
       if (m_stopping && !has_flush_pending_locked() && !has_active_buffer_locked()) {
+        update_backlog_locked();
         break;
       }
     }
@@ -667,12 +693,51 @@ private:
     if (!m_old_streams.empty()) {
       drain_old_streams();
     }
+    if (m_logger) {
+      m_logger->set(l_bluestore_wal_bypass_backlog_bytes, 0);
+    }
     m_enabled = false;
+  }
+
+  void on_file_opened() {
+    if (m_logger) {
+      m_logger->inc(l_bluestore_wal_bypass_files_total);
+    }
+  }
+
+  void on_bytes_written(size_t len) {
+    if (m_logger) {
+      m_logger->inc(l_bluestore_wal_bypass_bytes_total, len);
+    }
+  }
+
+  void on_write_error() {
+    if (m_logger) {
+      m_logger->inc(l_bluestore_wal_bypass_write_errors_total);
+    }
+  }
+
+  void on_flush_latency(ceph::timespan lat) {
+    if (m_logger) {
+      m_logger->tinc_with_max(l_bluestore_wal_bypass_flush_latency, lat);
+    }
+  }
+
+  void update_backlog_locked() {
+    if (!m_logger || !m_current_stream) {
+      return;
+    }
+    // 理论上不是很准，因为 m_old_streams 里可能还有一些待 flush 的数据
+    // 但是这个值主要是为了监控和 alert 的，所以不需要非常精准
+    const uint64_t backlog = m_current_stream->active_size() +
+      m_current_stream->flush_size();
+    m_logger->set(l_bluestore_wal_bypass_backlog_bytes, backlog);
   }
 };
 
-WalBypassCapture::WalBypassCapture(CephContext* cct)
-  : m_impl(std::make_unique<WalBypassCapture::Impl>(cct))
+WalBypassCapture::WalBypassCapture(CephContext* cct,
+                                   ceph::common::PerfCounters* logger)
+  : m_impl(std::make_unique<WalBypassCapture::Impl>(cct, logger))
 {
 }
 

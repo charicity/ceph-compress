@@ -6608,6 +6608,34 @@ void BlueStore::_init_logger()
     "srwc",
     PerfCountersBuilder::PRIO_USEFUL);
 
+  b.add_u64_counter(l_bluestore_wal_bypass_bytes_total,
+    "wal_bypass_bytes_total",
+    "Total bytes captured by bluerocks wal bypass",
+    "wbbt",
+    PerfCountersBuilder::PRIO_USEFUL,
+    unit_t(UNIT_BYTES));
+  b.add_u64_counter(l_bluestore_wal_bypass_files_total,
+    "wal_bypass_files_total",
+    "Total wal bypass files created",
+    "wbft",
+    PerfCountersBuilder::PRIO_USEFUL);
+  b.add_time_avg(l_bluestore_wal_bypass_flush_latency,
+    "wal_bypass_flush_latency",
+    "Average wal bypass flush latency",
+    "wbfl",
+    PerfCountersBuilder::PRIO_USEFUL);
+  b.add_u64(l_bluestore_wal_bypass_backlog_bytes,
+    "wal_bypass_backlog_bytes",
+    "Current bytes pending in wal bypass buffers",
+    "wbbg",
+    PerfCountersBuilder::PRIO_USEFUL,
+    unit_t(UNIT_BYTES));
+  b.add_u64_counter(l_bluestore_wal_bypass_write_errors_total,
+    "wal_bypass_write_errors_total",
+    "Total wal bypass write or rotation errors",
+    "wber",
+    PerfCountersBuilder::PRIO_USEFUL);
+
   // Resulting size axis configuration for op histograms, values are in bytes
   PerfHistogramCommon::axis_config_d alloc_hist_x_axis_config{
     "Given size (bytes)",
@@ -8048,7 +8076,7 @@ int BlueStore::_prepare_db_environment(bool create, bool read_only,
     }
 
     if (cct->_conf->bluestore_bluefs_env_mirror) {
-      rocksdb::Env* a = new BlueRocksEnv(bluefs);
+      rocksdb::Env* a = new BlueRocksEnv(bluefs, logger);
       rocksdb::Env* b = rocksdb::Env::Default();
       if (create) {
         string cmd = "rm -rf " + path + "/db " +
@@ -8059,7 +8087,7 @@ int BlueStore::_prepare_db_environment(bool create, bool read_only,
       }
       env = new rocksdb::EnvMirror(b, a, false, true);
     } else {
-      env = new BlueRocksEnv(bluefs);
+      env = new BlueRocksEnv(bluefs, logger);
 
       // simplify the dir names, too, as "seen" by rocksdb
       fn = "db";

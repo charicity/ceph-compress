@@ -235,6 +235,14 @@ enum {
   l_bluestore_slow_committed_kv_count,
   l_bluestore_slow_read_onode_meta_count,
   l_bluestore_slow_read_wait_aio_count,
+
+  // wal bypass counter
+  //****************************************
+  l_bluestore_wal_bypass_bytes_total,
+  l_bluestore_wal_bypass_files_total,
+  l_bluestore_wal_bypass_flush_latency,
+  l_bluestore_wal_bypass_backlog_bytes,
+  l_bluestore_wal_bypass_write_errors_total,
   //****************************************
   l_bluestore_last
 };

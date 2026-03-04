@@ -10,7 +10,8 @@
 
 class WalBypassCapture {
 public:
-  explicit WalBypassCapture(CephContext* cct);
+  explicit WalBypassCapture(CephContext* cct,
+                            ceph::common::PerfCounters* logger = nullptr);
   ~WalBypassCapture();
 
   bool enabled() const;

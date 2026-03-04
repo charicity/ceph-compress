@@ -197,12 +197,13 @@ class BlueRocksWritableFile : public rocksdb::WritableFile {
   BlueRocksWritableFile(BlueFS *fs,
                         BlueFS::FileWriter *h,
                         const std::string& fname,
+                        ceph::common::PerfCounters* bluestore_logger,
                         bool may_be_wal)
     : fs(fs), h(h)
   {
     // may_be_wal 有点蠢，但是确实很有必要
     if (may_be_wal && is_wal_file(fname)) {
-      wal_bypass = std::make_unique<WalBypassCapture>(fs->cct);
+      wal_bypass = std::make_unique<WalBypassCapture>(fs->cct, bluestore_logger);
     }
   }
   ~BlueRocksWritableFile() override {
@@ -360,9 +361,10 @@ class BlueRocksFileLock : public rocksdb::FileLock {
 // --- BlueRocksEnv ---
 // --------------------
 
-BlueRocksEnv::BlueRocksEnv(BlueFS *f)
+BlueRocksEnv::BlueRocksEnv(BlueFS *f, ceph::common::PerfCounters* logger)
   : EnvWrapper(Env::Default()),  // forward most of it to POSIX
-    fs(f)
+    fs(f),
+    bluestore_logger(logger)
 {
 
 }
@@ -407,7 +409,7 @@ rocksdb::Status BlueRocksEnv::NewWritableFile(
   int r = fs->open_for_write(dir, file, &h, false);
   if (r < 0)
     return err_to_status(r);
-  result->reset(new BlueRocksWritableFile(fs, h, fname, true));
+  result->reset(new BlueRocksWritableFile(fs, h, fname, bluestore_logger, true));
   return rocksdb::Status::OK();
 }
 
@@ -428,7 +430,7 @@ rocksdb::Status BlueRocksEnv::ReuseWritableFile(
   r = fs->open_for_write(new_dir, new_file, &h, true);
   if (r < 0)
     return err_to_status(r);
-  result->reset(new BlueRocksWritableFile(fs, h, new_fname, true));
+  result->reset(new BlueRocksWritableFile(fs, h, new_fname, bluestore_logger, true));
   fs->sync_metadata(false);
   return rocksdb::Status::OK();
 }
