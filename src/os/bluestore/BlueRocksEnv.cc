@@ -220,6 +220,10 @@ class BlueRocksWritableFile : public rocksdb::WritableFile {
     : fs(fs), h(h), wal_bypass(nullptr)
   {
     if (may_be_wal && bypass && is_wal_file(fname)) {
+      // Pad the bypass stream to the next 32 KB block boundary before the
+      // new WAL segment begins.  This keeps log::Reader aligned so it can
+      // correctly parse all subsequent records.
+      bypass->notify_new_wal();
       wal_bypass = bypass;
     }
   }

@@ -79,6 +79,16 @@ target_link_libraries(ceph-kvstore-tool
   os global)
 install(TARGETS ceph-kvstore-tool DESTINATION bin)
 
+add_executable(ceph-bluestore-wal-replay
+  ceph_bluestore_wal_replay.cc)
+target_link_libraries(ceph-bluestore-wal-replay
+  global kv os)
+target_include_directories(ceph-bluestore-wal-replay PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/rocksdb)
+target_compile_definitions(ceph-bluestore-wal-replay PRIVATE
+  ROCKSDB_PLATFORM_POSIX ROCKSDB_LIB_IO_POSIX)
+install(TARGETS ceph-bluestore-wal-replay DESTINATION bin)
+
 set(ceph_conf_srcs ceph_conf.cc)
 add_executable(ceph-conf ${ceph_conf_srcs})
 target_link_libraries(ceph-conf global)

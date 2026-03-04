@@ -262,6 +262,9 @@ public:
   ~RocksDBStore() override;
 
   static bool check_omap_dir(std::string &omap_dir);
+  /// Get the raw rocksdb::DB pointer (for tools that need direct access).
+  rocksdb::DB* get_raw_db() const { return db; }
+
   /// Opens underlying db
   int open(std::ostream &out, const std::string& cfs="") override {
     return do_open(out, false, false, cfs);

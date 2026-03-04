@@ -2,6 +2,7 @@
 // vim: ts=8 sw=2 sts=2 expandtab
 
 #include "WalBypassCapture.hpp"
+#include "WalBypassUtil.h"
 
 #include "BlueStore.h"
 #include "common/ceph_context.h"
@@ -63,48 +64,11 @@ int fsync_directory(const fs::path& dir)
 
 // ---------------------------------------------------------------------------
 
-std::string make_wal_bypass_filename(uint64_t seq)
-{
-  char name[64] = {0};
-  int r = snprintf(name, sizeof(name), "ceph_wal_%010llu.log",
-                   static_cast<unsigned long long>(seq));
-  ceph_assert(r > 0);
-  return std::string(name);
-}
+} // anonymous namespace
 
-bool parse_wal_bypass_seq(const std::string& name, uint64_t& seq)
-{
-  constexpr std::string_view prefix = "ceph_wal_";
-  constexpr std::string_view suffix = ".log";
-  if (name.size() <= prefix.size() + suffix.size()) {
-    return false;
-  }
-  if (name.compare(0, prefix.size(), prefix) != 0) {
-    return false;
-  }
-  if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
-    return false;
-  }
+// Use make_wal_bypass_filename() and parse_wal_bypass_seq() from WalBypassUtil.h
 
-  const size_t begin = prefix.size();
-  const size_t end = name.size() - suffix.size();
-  for (size_t i = begin; i < end; ++i) {
-    if (name[i] < '0' || name[i] > '9') {
-      return false;
-    }
-  }
-
-  errno = 0;
-  char* parse_end = nullptr;
-  unsigned long long value = strtoull(name.c_str() + begin, &parse_end, 10);
-  if (errno != 0 || parse_end == nullptr ||
-      static_cast<size_t>(parse_end - name.c_str()) != end) {
-    return false;
-  }
-
-  seq = static_cast<uint64_t>(value);
-  return true;
-}
+namespace {
 
 class WalBypassSeqState {
 private:
@@ -521,6 +485,11 @@ private:
   // active_buffer operations: called under m_lock by front-end.
   std::unique_ptr<WalBypassCaptureStream> m_current_stream;
 
+  // Total bytes appended to the bypass stream (across all files).
+  // Updated under m_lock by front-end append().
+  // Used by notify_new_wal() to compute 32 KB padding.
+  uint64_t m_total_appended_bytes = 0;
+
   std::mutex m_lock;
   std::condition_variable m_cond;
   std::thread m_worker;
@@ -580,6 +549,10 @@ public:
       return;
     }
 
+    // Persist the sharding definition so the replay tool can create
+    // a skeleton DB with matching Column Family layout.
+    persist_sharding_meta();
+
     {
       // open_next_stream sets m_current_stream; safe without lock since
       // worker thread is not started yet.
@@ -631,10 +604,44 @@ public:
     }
 
     m_current_stream->append_to_active(data, len);
+    m_total_appended_bytes += len;
     if (m_current_stream->active_size() >= m_flush_trigger_bytes ||
         now - m_last_enqueue >= m_flush_interval) {
       enqueue_flush_locked(now);
     }
+    update_backlog_locked();
+  }
+
+  /// Pad bypass stream to next 32 KB block boundary.
+  /// Called when RocksDB opens a new WAL file.  The zero padding causes
+  /// log::Reader to skip to the start of the next block, keeping WAL segment
+  /// records aligned.  (RocksDB treats kZeroType records as skip markers.)
+  static constexpr uint32_t kWalBlockSize = 32768;  // rocksdb::log::kBlockSize
+
+  void notify_new_wal() {
+    if (!m_enabled.load(std::memory_order_acquire) ||
+        m_failed.load(std::memory_order_acquire)) {
+      return;
+    }
+
+    std::unique_lock lk(m_lock);
+    if (!m_current_stream) {
+      return;
+    }
+
+    const uint32_t remainder = static_cast<uint32_t>(
+      m_total_appended_bytes % kWalBlockSize);
+    if (remainder == 0) {
+      // Already aligned, nothing to do.
+      return;
+    }
+    const uint32_t pad_len = kWalBlockSize - remainder;
+    // Allocate zero-filled padding.
+    std::string zeros(pad_len, '\0');
+    m_current_stream->append_to_active(zeros.data(), zeros.size());
+    m_total_appended_bytes += pad_len;
+    // Force an immediate flush so the padding reaches disk promptly.
+    enqueue_flush_locked(std::chrono::steady_clock::now());
     update_backlog_locked();
   }
 
@@ -647,6 +654,54 @@ private:
     m_current_stream->enqueue_flush();
     m_last_enqueue = now;
     m_cond.notify_one();
+  }
+
+  /// Persist bluestore_rocksdb_cfs sharding definition to the bypass
+  /// directory so the replay tool can create a matching skeleton DB.
+  /// Non-fatal: failure only logs a warning.
+  void persist_sharding_meta() {
+    if (m_bypass_dir.empty()) return;
+    bool use_cf = m_cct->_conf.get_val<bool>("bluestore_rocksdb_cf");
+    std::string sharding_text;
+    if (use_cf) {
+      sharding_text = m_cct->_conf.get_val<std::string>("bluestore_rocksdb_cfs");
+    }
+    fs::path meta_path = m_bypass_dir / "ceph_wal_sharding.meta";
+
+    // Atomic write: tmp → fsync → rename → fsync_directory
+    const auto ts = std::to_string(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+    fs::path tmp = meta_path;
+    tmp += ".tmp." + ts;
+    {
+      std::ofstream out(tmp, std::ios::out | std::ios::binary | std::ios::trunc);
+      if (!out.is_open()) {
+        ldout(m_cct, 1) << __func__ << " cannot write sharding meta to "
+                        << tmp << dendl;
+        return;
+      }
+      out << sharding_text;
+      out.flush();
+      if (!out.good()) {
+        std::error_code ec;
+        out.close();
+        fs::remove(tmp, ec);
+        return;
+      }
+    }
+    fsync_path(tmp);
+    std::error_code ec;
+    fs::rename(tmp, meta_path, ec);
+    if (ec) {
+      fs::remove(tmp, ec);
+      ldout(m_cct, 1) << __func__ << " failed to rename sharding meta: "
+                      << ec.message() << dendl;
+      return;
+    }
+    fsync_directory(m_bypass_dir);
+    ldout(m_cct, 5) << __func__ << " persisted sharding meta to "
+                    << meta_path << " (" << sharding_text.size()
+                    << " bytes)" << dendl;
   }
 
   bool has_flush_pending_locked() const {
@@ -901,4 +956,9 @@ bool WalBypassCapture::enabled() const
 void WalBypassCapture::append(const char* data, size_t len)
 {
   m_impl->append(data, len);
+}
+
+void WalBypassCapture::notify_new_wal()
+{
+  m_impl->notify_new_wal();
 }

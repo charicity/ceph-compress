@@ -16,6 +16,9 @@ public:
 
   bool enabled() const;
   void append(const char* data, size_t len);
+  /// Called when a new RocksDB WAL file begins.  Pads the bypass stream
+  /// to the next 32 KB block boundary so that log::Reader stays aligned.
+  void notify_new_wal();
 
 private:
   class Impl;
