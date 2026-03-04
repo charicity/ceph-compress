@@ -383,3 +383,40 @@ MVP 必须同时满足：
 
 **留档位置：**
 - `doc/wal/pr2-bypass-validation.rst`
+
+### 12.6 PR-3 当前进度（2026-03-04）
+
+已完成 PR-3 的核心能力与补充稳定性回归。
+
+**已落地内容：**
+- 在 `src/os/bluestore/BlueRocksEnv.cc` 完成严格轮转与序号持久化链路验证：
+  - 旁路文件按 `ceph_wal_<seq>.log` 严格递增；
+  - `ceph_wal_seq.state` 与最大文件序号保持 `+1` 一致；
+  - 支持按大小/时间触发轮转（本次重点验证 2 秒时间轮转）。
+- 在 3 OSD 场景下复现并定位一次 `osd.0` 段错误：
+  - 崩溃线程：`bstore_kv_sync`；
+  - 关键栈：`BlueRocksWritableFile::Append` / `WalBypassCapture` 路径；
+  - 根因：`flush_loop()` 对 `m_current_stream` 的写入/轮转与前台追加存在并发竞争。
+- 已完成并发修复：
+  - 调整 `flush_loop()`，确保对 `m_current_stream` 的关键访问在同一把锁下完成，
+    消除 `rotate_stream()` 与前台 `append()` 的生命周期竞争。
+
+**测试结论（PR-3）：**
+- 短压验证通过：序号连续、`state` 对齐、按时轮转可观测。
+- 修复后 3 OSD 长压（600 秒）通过：
+  - `rados bench` 正常结束（exit code 0）；
+  - `osd tree` 保持 `3 up / 3 in`；
+  - `out/osd.0.log/out/osd.1.log/out/osd.2.log` 中 `Segmentation fault` 计数均为 0；
+  - 旁路文件序号持续连续（样例：`1..1269`），`state=1270` 匹配。
+
+**观测备注：**
+- 压测后出现 `BlueFS spillover` 告警，属于容量/布局信号，
+  不等同于 WAL 旁路功能失败，后续需在容量治理中处理。
+
+**留档位置：**
+- `doc/wal/pr3-rotation-validation.rst`
+
+### 12.7 下一步建议（更新）
+
+- 进入 PR-4：补齐可观测性与告警指标（旁路吞吐、积压、错误计数、回放进度）。
+- 补一轮更长 soak（30~60 分钟）作为回归基线，形成可复用稳定性曲线。
