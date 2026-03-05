@@ -63,7 +63,8 @@ check_fail() { fail "$*"; ERRORS=$((ERRORS+1)); }
 cleanup() {
   info "Cleaning up ..."
   "$SRC_DIR/stop.sh" 2>/dev/null || true
-  rm -rf "$BYPASS_DIR" "$REPLAY_DB"
+  # 不删除以供调试
+  # rm -rf "$BYPASS_DIR" "$REPLAY_DB"
 }
 trap cleanup EXIT
 
@@ -127,8 +128,12 @@ info "Creating pool 'testbench' ..."
 sleep 2
 
 info "Running rados bench for ${BENCH_SEC}s ..."
-./bin/rados -p testbench bench "$BENCH_SEC" write -b 4096 --no-cleanup 2>&1 | \
-  grep -E 'Bandwidth|IOPS|Latency' || true
+BENCH_TMP="/tmp/bench_output_$$"
+./bin/rados -p testbench bench "$BENCH_SEC" write -b 4096 --no-cleanup 2>&1 | tee "$BENCH_TMP"
+echo ""
+info "=== Bench Summary ==="
+grep -E 'Bandwidth|IOPS|Latency' "$BENCH_TMP" || true
+rm -f "$BENCH_TMP"
 
 # ---------------------------------------------------------------------------
 # 5. Stop cluster

@@ -34,39 +34,68 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// POSIX fsync helpers
-// ---------------------------------------------------------------------------
-
-int fsync_path(const fs::path& p)
+bool atomic_write_file(CephContext* cct,
+                       const fs::path& dir,
+                       const fs::path& dst,
+                       std::string_view content,
+                       const char* context)
 {
-  int fd = ::open(p.c_str(), O_RDONLY);
-  if (fd < 0) {
-    return -errno;
+  std::error_code ec;
+  if (!fs::exists(dir, ec) || ec) {
+    lderr(cct) << context << " state dir missing/unavailable: " << dir
+               << " ec=" << ec.message() << dendl;
+    return false;
   }
-  int r = ::fdatasync(fd);
-  int save = errno;
-  ::close(fd);
-  return r < 0 ? -save : 0;
-}
 
-int fsync_directory(const fs::path& dir)
-{
-  int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
-  if (fd < 0) {
-    return -errno;
+  const auto unique_suffix = std::to_string(
+    std::chrono::steady_clock::now().time_since_epoch().count());
+  fs::path tmp = dst;
+  tmp += ".tmp." + unique_suffix;
+
+  {
+    std::ofstream out(tmp, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+      lderr(cct) << context << " failed to open tmp file " << tmp << dendl;
+      return false;
+    }
+    out.write(content.data(), static_cast<std::streamsize>(content.size()));
+    out.flush();
+    if (!out.good()) {
+      out.close();
+      fs::remove(tmp, ec);
+      lderr(cct) << context << " failed to flush tmp file " << tmp << dendl;
+      return false;
+    }
   }
-  int r = ::fsync(fd);
-  int save = errno;
-  ::close(fd);
-  return r < 0 ? -save : 0;
+
+  if (int r = wal_fsync_path(tmp); r < 0) {
+    lderr(cct) << context << " failed to fsync tmp file " << tmp
+               << " r=" << r << dendl;
+    fs::remove(tmp, ec);
+    return false;
+  }
+
+  fs::rename(tmp, dst, ec);
+  if (ec) {
+    fs::remove(tmp, ec);
+    lderr(cct) << context << " failed to rename " << tmp
+               << " to " << dst << " ec=" << ec.message() << dendl;
+    return false;
+  }
+
+  // Persist the directory entry created by rename.
+  if (int r = wal_fsync_directory(dir); r < 0) {
+    lderr(cct) << context << " failed to fsync dir " << dir
+               << " after rename, r=" << r << dendl;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
 
 } // anonymous namespace
 
-// Use make_wal_bypass_filename() and parse_wal_bypass_seq() from WalBypassUtil.h
+// Use wal_bypass_file_t codec utilities from WalBypassUtil.h
 
 namespace {
 
@@ -92,11 +121,7 @@ public:
     if (has_state && state_next > next_seq) {
       next_seq = state_next;
     }
-    if (next_seq == 0) {
-      next_seq = 1;
-    }
-    m_next_seq = next_seq;
-    if (!persist_state_file(m_next_seq)) {
+    if (!assign_and_persist_next_seq(next_seq)) {
       lderr(m_cct) << __func__ << " failed to persist initial next_seq="
                    << m_next_seq << " state_path=" << m_state_path << dendl;
       return false;
@@ -124,8 +149,7 @@ public:
       return false;
     }
 
-    m_next_seq = opened_seq + 1;
-    if (!persist_state_file(m_next_seq)) {
+    if (!assign_and_persist_next_seq(opened_seq + 1)) {
       lderr(m_cct) << __func__ << " failed to persist next_seq="
                    << m_next_seq << " after opened_seq=" << opened_seq
                    << dendl;
@@ -140,8 +164,7 @@ public:
     if (m_next_seq < min_next_seq) {
       ldout(m_cct, 5) << __func__ << " correcting next_seq from " << m_next_seq
                       << " to " << min_next_seq << dendl;
-      m_next_seq = min_next_seq;
-      if (!persist_state_file(m_next_seq)) {
+      if (!assign_and_persist_next_seq(min_next_seq)) {
         lderr(m_cct) << __func__ << " failed to persist corrected next_seq="
                      << m_next_seq << dendl;
         return false;
@@ -151,60 +174,10 @@ public:
   }
 
 private:
-  bool persist_state_file(uint64_t value) const {
-    std::error_code ec;
-    if (!fs::exists(m_dir, ec) || ec) {
-      lderr(m_cct) << __func__ << " state dir missing/unavailable: " << m_dir
-                   << " ec=" << ec.message() << dendl;
-      return false;
-    }
-
-    const auto unique_suffix = std::to_string(
-      std::chrono::steady_clock::now().time_since_epoch().count());
-    fs::path tmp = m_state_path;
-    tmp += ".tmp." + unique_suffix;
-
-    {
-      std::ofstream out(tmp, std::ios::out | std::ios::binary | std::ios::trunc);
-      if (!out.is_open()) {
-        lderr(m_cct) << __func__ << " failed to open tmp state file " << tmp
-                     << dendl;
-        return false;
-      }
-      out << value << "\n";
-      out.flush();
-      if (!out.good()) {
-        out.close();
-        fs::remove(tmp, ec);
-        lderr(m_cct) << __func__ << " failed to flush tmp state file " << tmp
-                     << dendl;
-        return false;
-      }
-    }
-
-    // fsync the tmp file content before rename
-    if (int r = fsync_path(tmp); r < 0) {
-      lderr(m_cct) << __func__ << " failed to fsync tmp state file " << tmp
-                   << " r=" << r << dendl;
-      fs::remove(tmp, ec);
-      return false;
-    }
-
-    fs::rename(tmp, m_state_path, ec);
-    if (ec) {
-      fs::remove(tmp, ec);
-      lderr(m_cct) << __func__ << " failed to rename " << tmp << " to "
-                   << m_state_path << " ec=" << ec.message() << dendl;
-      return false;
-    }
-
-    // fsync directory to persist the rename (directory entry)
-    if (int r = fsync_directory(m_dir); r < 0) {
-      lderr(m_cct) << __func__ << " failed to fsync dir " << m_dir
-                   << " after rename, r=" << r << dendl;
-      // non-fatal: data is written, rename done, just dir entry may not be durable
-    }
-    return true;
+  bool assign_and_persist_next_seq(uint64_t next_seq) {
+    m_next_seq = next_seq;
+    const std::string state = std::to_string(m_next_seq) + "\n";
+    return atomic_write_file(m_cct, m_dir, m_state_path, state, __func__);
   }
 
   bool read_state_file(uint64_t* value) const {
@@ -216,13 +189,7 @@ private:
     }
 
     uint64_t parsed = 0;
-    in >> parsed;
-    if (!in.good() && !in.eof()) {
-      lderr(m_cct) << __func__ << " failed reading state file "
-                   << m_state_path << dendl;
-      return false;
-    }
-    if (in.fail()) {
+    if (!(in >> parsed)) {
       lderr(m_cct) << __func__ << " invalid state content in "
                    << m_state_path << dendl;
       return false;
@@ -250,10 +217,11 @@ private:
       if (!it->is_regular_file(ec) || ec) {
         continue;
       }
-      uint64_t seq = 0;
-      if (parse_wal_bypass_seq(it->path().filename().string(), seq) &&
-          seq > max_seq) {
-        max_seq = seq;
+      wal_bypass_file_t file;
+      if (wal_bypass_file_t::from_filename(it->path().filename().string(),
+                                           &file) &&
+          file.seq > max_seq) {
+        max_seq = file.seq;
       }
     }
     return max_seq;
@@ -269,7 +237,6 @@ private:
   bool m_path_exists = false;
   int m_fd = -1;
   uint64_t m_bytes_written = 0;
-  bool m_flush_pending = false;
   std::string m_active_buffer;
   std::string m_flush_buffer;
   std::chrono::steady_clock::time_point m_opened_at =
@@ -281,7 +248,7 @@ public:
                                   uint64_t seq)
     : m_cct(cct),
       m_dir(std::move(dir)),
-      m_path(m_dir / make_wal_bypass_filename(seq)),
+      m_path(m_dir / wal_bypass_file_t(seq).filename()),
       m_seq(seq) {
   }
 
@@ -311,7 +278,7 @@ public:
     m_opened_at = std::chrono::steady_clock::now();
 
     // fsync directory to persist the new directory entry
-    fsync_directory(m_dir);
+    wal_fsync_directory(m_dir);
 
     ldout(m_cct, 15) << __func__ << " opened stream seq=" << m_seq
                      << " path=" << m_path << dendl;
@@ -354,11 +321,11 @@ public:
   }
 
   bool has_flush_pending() const {
-    return m_flush_pending;
+    return !m_flush_buffer.empty();
   }
 
   size_t flush_size() const {
-    return m_flush_pending ? m_flush_buffer.size() : 0;
+    return m_flush_buffer.size();
   }
 
   void enqueue_flush() {
@@ -366,21 +333,19 @@ public:
       return;
     }
 
-    if (m_flush_pending) {
+    if (!m_flush_buffer.empty()) {
       m_flush_buffer.append(m_active_buffer);
       m_active_buffer.clear();
     } else {
       m_active_buffer.swap(m_flush_buffer);
-      m_flush_pending = true;
     }
   }
 
   bool dequeue_flush(std::string* out) {
-    if (!m_flush_pending) {
+    if (m_flush_buffer.empty()) {
       return false;
     }
     out->swap(m_flush_buffer);
-    m_flush_pending = false;
     return true;
   }
 
@@ -636,9 +601,8 @@ public:
       return;
     }
     const uint32_t pad_len = kWalBlockSize - remainder;
-    // Allocate zero-filled padding.
-    std::string zeros(pad_len, '\0');
-    m_current_stream->append_to_active(zeros.data(), zeros.size());
+    static constexpr char zeros[kWalBlockSize] = {}; // avoid extra memset
+    m_current_stream->append_to_active(zeros, pad_len);
     m_total_appended_bytes += pad_len;
     // Force an immediate flush so the padding reaches disk promptly.
     enqueue_flush_locked(std::chrono::steady_clock::now());
@@ -660,7 +624,6 @@ private:
   /// directory so the replay tool can create a matching skeleton DB.
   /// Non-fatal: failure only logs a warning.
   void persist_sharding_meta() {
-    if (m_bypass_dir.empty()) return;
     bool use_cf = m_cct->_conf.get_val<bool>("bluestore_rocksdb_cf");
     std::string sharding_text;
     if (use_cf) {
@@ -668,37 +631,13 @@ private:
     }
     fs::path meta_path = m_bypass_dir / "ceph_wal_sharding.meta";
 
-    // Atomic write: tmp → fsync → rename → fsync_directory
-    const auto ts = std::to_string(
-      std::chrono::steady_clock::now().time_since_epoch().count());
-    fs::path tmp = meta_path;
-    tmp += ".tmp." + ts;
-    {
-      std::ofstream out(tmp, std::ios::out | std::ios::binary | std::ios::trunc);
-      if (!out.is_open()) {
-        ldout(m_cct, 1) << __func__ << " cannot write sharding meta to "
-                        << tmp << dendl;
-        return;
-      }
-      out << sharding_text;
-      out.flush();
-      if (!out.good()) {
-        std::error_code ec;
-        out.close();
-        fs::remove(tmp, ec);
-        return;
-      }
-    }
-    fsync_path(tmp);
-    std::error_code ec;
-    fs::rename(tmp, meta_path, ec);
-    if (ec) {
-      fs::remove(tmp, ec);
-      ldout(m_cct, 1) << __func__ << " failed to rename sharding meta: "
-                      << ec.message() << dendl;
+    if (!atomic_write_file(
+          m_cct, m_bypass_dir, meta_path, sharding_text, __func__)) {
+      ldout(m_cct, 1) << __func__ << " failed to persist sharding meta"
+                      << dendl;
       return;
     }
-    fsync_directory(m_bypass_dir);
+
     ldout(m_cct, 5) << __func__ << " persisted sharding meta to "
                     << meta_path << " (" << sharding_text.size()
                     << " bytes)" << dendl;
@@ -730,16 +669,14 @@ private:
           m_seq_state->on_file_exists_conflict();
           continue;
         }
-        on_write_error();
-        return nullptr;
+        return fail_create_stream();
       }
 
       if (!m_seq_state->commit_opened_seq(stream->seq())) {
         stream->sync_and_close();
         lderr(m_cct) << __func__ << " failed to commit opened seq="
                      << stream->seq() << dendl;
-        on_write_error();
-        return nullptr;
+        return fail_create_stream();
       }
       return stream;
     }
@@ -767,7 +704,6 @@ private:
         lderr(m_cct) << __func__ << " failed closing old stream" << dendl;
         // non-fatal for rotation; continue opening new stream
       }
-      old_stream.reset();
     }
 
     // Phase 3: Open new stream without lock (file I/O).
@@ -804,11 +740,10 @@ private:
     std::string local;
 
     while (true) {
-      bool got_data = false;
-
       // === Phase 1: Dequeue under lock ===
       {
         std::unique_lock lk(m_lock);
+        update_backlog_locked();
         if (!has_flush_pending_locked()) {
           m_cond.wait_for(lk, m_flush_interval, [this] {
             return has_flush_pending_locked() || m_stopping;
@@ -825,49 +760,43 @@ private:
         }
 
         if (m_current_stream) {
-          got_data = m_current_stream->dequeue_flush(&local);
+          m_current_stream->dequeue_flush(&local);
         }
       }
       // Lock released — front-end append() can run freely now.
 
+      if (local.empty()) {
+        continue;
+      }
+
       // === Phase 2: Write I/O without lock ===
       // m_current_stream pointer is stable here: only this thread modifies it
       // (via rotate_stream_unlocked), and we haven't rotated yet.
-      if (got_data && !local.empty() && m_current_stream) {
-        auto t0 = mono_clock::now();
-        const bool write_ok = m_current_stream->write(local.data(), local.size());
-        auto flush_lat = mono_clock::now() - t0;
-        on_flush_latency(flush_lat);
+      auto t0 = mono_clock::now();
+      const bool write_ok = m_current_stream->write(local.data(), local.size());
+      auto flush_lat = mono_clock::now() - t0;
+      on_flush_latency(flush_lat);
 
-        if (!write_ok) {
-          lderr(m_cct) << __func__ << " bypass write failed, disabling capture"
-                       << dendl;
-          m_failed.store(true, std::memory_order_release);
-          on_write_error();
-          local.clear();
-          continue;  // loop back to check m_stopping
-        }
-        on_bytes_written(local.size());
+      if (!write_ok) {
+        lderr(m_cct) << __func__ << " bypass write failed, disabling capture"
+                     << dendl;
+        m_failed.store(true, std::memory_order_release);
+        on_write_error();
         local.clear();
-
-        // === Phase 3: Check rotation without lock ===
-        // rotate policy + stream stats are read-only here; safe.
-        if (m_rotate_policy && m_current_stream &&
-            m_rotate_policy->should_rotate(*m_current_stream)) {
-          if (!rotate_stream_unlocked()) {
-            lderr(m_cct) << __func__ << " rotate failed, disabling capture"
-                         << dendl;
-            // m_failed already set by rotate_stream_unlocked
-          }
-        }
-      } else {
-        local.clear();
+        continue;  // loop back to check m_stopping
       }
+      on_bytes_written(local.size());
+      local.clear();
 
-      // === Phase 4: Update backlog under lock ===
-      {
-        std::unique_lock lk(m_lock);
-        update_backlog_locked();
+      // === Phase 3: Check rotation without lock ===
+      // rotate policy + stream stats are read-only here; safe.
+      if (m_rotate_policy && m_current_stream &&
+          m_rotate_policy->should_rotate(*m_current_stream)) {
+        if (!rotate_stream_unlocked()) {
+          lderr(m_cct) << __func__ << " rotate failed, disabling capture"
+                       << dendl;
+          // m_failed already set by rotate_stream_unlocked
+        }
       }
     }
   }
@@ -918,6 +847,11 @@ private:
     }
   }
 
+  std::unique_ptr<WalBypassCaptureStream> fail_create_stream() {
+    on_write_error();
+    return nullptr;
+  }
+
   void on_data_dropped(size_t /* len */) {
     if (m_logger) {
       m_logger->inc(l_bluestore_wal_bypass_drops_total);
@@ -931,9 +865,15 @@ private:
   }
 
   void update_backlog_locked() {
-    if (!m_logger || !m_current_stream) {
+    if (!m_logger) {
       return;
     }
+
+    if (!m_current_stream) {
+      m_logger->set(l_bluestore_wal_bypass_backlog_bytes, 0);
+      return;
+    }
+
     const uint64_t backlog = m_current_stream->active_size() +
       m_current_stream->flush_size();
     m_logger->set(l_bluestore_wal_bypass_backlog_bytes, backlog);

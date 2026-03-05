@@ -117,22 +117,14 @@ static bool write_checkpoint(const fs::path& path, const Checkpoint& cp)
     }
   }
 
-  // fsync + rename
-  {
-    int fd = ::open(tmp.c_str(), O_RDONLY);
-    if (fd >= 0) { ::fdatasync(fd); ::close(fd); }
-  }
+  wal_fsync_path(tmp);
   std::error_code ec;
   fs::rename(tmp, path, ec);
   if (ec) {
     fs::remove(tmp, ec);
     return false;
   }
-  // fsync parent directory
-  {
-    int fd = ::open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
-    if (fd >= 0) { ::fsync(fd); ::close(fd); }
-  }
+  wal_fsync_directory(path.parent_path());
   return true;
 }
 
@@ -173,9 +165,9 @@ static int scan_wal_files(const std::string& wal_dir,
       return -EIO;
     }
     if (!it->is_regular_file(ec) || ec) continue;
-    uint64_t seq = 0;
-    if (parse_wal_bypass_seq(it->path().filename().string(), seq)) {
-      files.push_back({seq, it->path()});
+    wal_bypass_file_t file;
+    if (wal_bypass_file_t::from_filename(it->path().filename().string(), &file)) {
+      files.push_back({file.seq, it->path()});
     }
   }
   std::sort(files.begin(), files.end());
@@ -219,6 +211,10 @@ public:
   }
   rocksdb::Status MergeCF(uint32_t cf, const rocksdb::Slice&,
                           const rocksdb::Slice&) override {
+    return validate(cf);
+  }
+  rocksdb::Status DeleteRangeCF(uint32_t cf, const rocksdb::Slice&,
+                                const rocksdb::Slice&) override {
     return validate(cf);
   }
 
@@ -268,6 +264,24 @@ static std::string read_sharding_meta(const std::string& wal_dir)
 }
 
 // ============================================================================
+// Compute max CF id from sharding text
+// ============================================================================
+
+static uint32_t compute_max_cf_id(const std::string& sharding_text)
+{
+  if (sharding_text.empty()) {
+    return 0;
+  }
+  std::vector<RocksDBStore::ColumnFamily> sharding_def;
+  RocksDBStore::parse_sharding_def(sharding_text, sharding_def);
+  uint32_t count = 0;
+  for (auto& cf : sharding_def) {
+    count += cf.shard_cnt;
+  }
+  return count;
+}
+
+// ============================================================================
 // Open target DB — POSIX mode
 // ============================================================================
 
@@ -311,29 +325,7 @@ static int open_posix_db(const ReplayOptions& opt,
   }
 
   raw_db = store->get_raw_db();
-
-  // Determine max CF id by listing all column families
-  std::vector<std::string> cf_names;
-  auto status = rocksdb::DB::ListColumnFamilies(
-    rocksdb::DBOptions(), opt.db_path, &cf_names);
-  // After create_and_open the DB is open, but ListColumnFamilies may fail on
-  // an in-use DB. Instead, count via the store's cf_handles size.
-  // We'll just use a generous upper bound based on number of CFs.
-  // Typical BlueStore: default(0) + up to ~11 CFs = max id ~11.
-  // Let's use a simple approach: get max id from the DB's metadata.
-  max_cf_id = 0;
-  // The DB assigns CF IDs sequentially: default=0, then 1,2,3... for each
-  // CF created by create_shards (in order of sharding_def iteration).
-  // We can compute it from the sharding text.
-  if (!sharding_text.empty()) {
-    std::vector<RocksDBStore::ColumnFamily> sharding_def;
-    RocksDBStore::parse_sharding_def(sharding_text, sharding_def);
-    uint32_t count = 0;
-    for (auto& cf : sharding_def) {
-      count += cf.shard_cnt;
-    }
-    max_cf_id = count;  // default is 0, CFs are 1..count
-  }
+  max_cf_id = compute_max_cf_id(sharding_text);
 
   std::cout << "Opened POSIX RocksDB at " << opt.db_path
             << " with max_cf_id=" << max_cf_id << std::endl;
@@ -345,6 +337,7 @@ static int open_posix_db(const ReplayOptions& opt,
 // ============================================================================
 
 static int open_bluestore_db(const ReplayOptions& opt,
+                             const std::string& sharding_text,
                              std::unique_ptr<BlueStore>& bluestore,
                              rocksdb::DB*& raw_db,
                              uint32_t& max_cf_id)
@@ -367,17 +360,7 @@ static int open_bluestore_db(const ReplayOptions& opt,
   }
 
   raw_db = rocks_db->get_raw_db();
-
-  // Determine max CF id from the store's internal mapping
-  max_cf_id = 0;
-  // List CFs from disk
-  std::vector<std::string> cf_names;
-  auto status = rocksdb::DB::ListColumnFamilies(
-    rocksdb::DBOptions(), opt.osd_path + "/db", &cf_names);
-  if (status.ok() && !cf_names.empty()) {
-    // max id = number of CFs - 1 (they are assigned sequentially)
-    max_cf_id = static_cast<uint32_t>(cf_names.size() - 1);
-  }
+  max_cf_id = compute_max_cf_id(sharding_text);
 
   std::cout << "Opened BlueStore DB at " << opt.osd_path
             << " with max_cf_id=" << max_cf_id << std::endl;
@@ -677,18 +660,11 @@ int main(int argc, const char** argv)
       r = open_posix_db(opt, sharding_text, posix_store, raw_db, max_cf_id);
       if (r < 0) return EXIT_FAILURE;
     } else if (opt.mode == "bluestore") {
-      r = open_bluestore_db(opt, bluestore, raw_db, max_cf_id);
+      r = open_bluestore_db(opt, sharding_text, bluestore, raw_db, max_cf_id);
       if (r < 0) return EXIT_FAILURE;
     }
   } else {
-    // For verify-only, compute max_cf_id from sharding text
-    if (!sharding_text.empty()) {
-      std::vector<RocksDBStore::ColumnFamily> sharding_def;
-      RocksDBStore::parse_sharding_def(sharding_text, sharding_def);
-      for (auto& cf : sharding_def) {
-        max_cf_id += cf.shard_cnt;
-      }
-    }
+    max_cf_id = compute_max_cf_id(sharding_text);
   }
 
   // ---- Step 3: Load checkpoint ----
@@ -755,7 +731,6 @@ int main(int argc, const char** argv)
       rocksdb::FlushOptions fopts;
       fopts.wait = true;
       fopts.allow_write_stall = true;
-      raw_db->FlushWAL(true);
       // Flush all column families
       auto s = raw_db->Flush(fopts);
       if (!s.ok()) {
