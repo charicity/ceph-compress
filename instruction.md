@@ -89,9 +89,9 @@ MVP 必须同时满足：
 - **PR-3** 轮转与序号持久化：完成；修复并发崩溃问题。
 - **PR-4** 可观测性：完成；新增 perf 指标并在线验证。
 - **PR-5** 回放工具 MVP：完成（scan/verify/replay/checkpoint/stop）。
+- **PR-6** 测试与演练脚本闭环：完成（5/50 对象 ALL CHECKS PASSED）。`--recover` 模式实现一键 `mkfs + WAL 回放 + 后处理修复`，端到端恢复验证通过。关键发现：回放后需清除 BitmapFreelistManager 位图（切换 NullFM 从 ONode 重建分配表）、清除 PREFIX_DEFERRED 延迟事务（避免 double-free）、per-OSD 旁路目录隔离（`$id` 元变量）。详见 `doc/wal/pr6-recovery-validation.rst`。
 
 ### 待完成
-- **PR-6** 测试与演练脚本闭环：`mkfs + replay + OSD + health`。
 - **PR-7** 回放审计增强：`--verify-only` 深化、断裂定位、审计输出。
 - **PR-8** 运维手册/SOP：值班可执行恢复流程与故障处置。
 
@@ -133,6 +133,7 @@ MVP 必须同时满足：
 - `doc/wal/pr3-rotation-validation.rst`
 - `doc/wal/pr4-observability-validation.rst`
 - `doc/wal/pr5-replay-tool.rst`
+- `doc/wal/pr6-recovery-validation.rst`
 
 ---
 
@@ -162,7 +163,6 @@ MVP 必须同时满足：
 
 ## 11. 下一步（建议执行顺序）
 
-- **PR-6** 测试与演练脚本闭环：`mkfs + replay + OSD + health`。
 - **PR-7** 回放审计增强：`--verify-only` 深化、断裂定位、审计输出。
 - **PR-8** 运维手册/SOP：值班可执行恢复流程与故障处置。
 4. **PR-9**（前置改造）：回放工具增加 `--start-seq` / `--snapshot-dir` 参数，放松 `validate_continuity` 约束。
