@@ -486,6 +486,111 @@ PR-5 修改（``notify_new_wal``、sharding 元数据持久化）不影响
    不验证 CF 的逻辑含义。如果 CF 布局与原始 OSD 不完全匹配，
    数据可能写入错误的 CF。
 
+代码审查后续清理
+----------------
+
+PR-5 验证完毕后，经代码审查发现若干可精简或复用的地方，进行了以下整理，
+三个文件均通过 ``ninja ceph-bluestore-wal-replay ceph-osd`` 增量构建验证。
+
+**1. 提取 ``compute_max_cf_id()`` 辅助函数**
+
+原代码中三处（``open_posix_db``、``open_bluestore_db``、verify-only 分支）
+各自重复了相同的 sharding 定义遍历逻辑。提取为静态函数后统一调用，消除约 30 行重复代码。
+``open_bluestore_db`` 签名同步增加 ``sharding_text`` 参数。
+
+**2. 删除 ``open_posix_db`` / ``open_bluestore_db`` 中的死代码**
+
+两个函数中均调用了 ``rocksdb::DB::ListColumnFamilies``，但其结果（``cf_names`` / ``status``）
+实际从未使用——``max_cf_id`` 已由 sharding 文本直接计算。删除相关调用及遗留注释共约 20 行。
+
+**3. ``wal_fsync_path`` / ``wal_fsync_directory`` 提升至 ``WalBypassUtil.h``**
+
+``WalBypassCapture.cpp`` 匿名命名空间内定义的 ``fsync_path()`` / ``fsync_directory()``
+与 ``write_checkpoint`` 中手写的 ``::open/fdatasync/close`` 块实现了完全相同的语义。
+将两个函数以 ``inline`` 形式提升到 ``WalBypassUtil.h``，命名为 ``wal_fsync_path`` /
+``wal_fsync_directory``，删除 ``WalBypassCapture.cpp`` 中的重复定义，
+``write_checkpoint`` 改为调用共享实现。
+
+**4. ``CfValidator`` 补充 ``DeleteRangeCF`` 覆盖**
+
+``rocksdb::WriteBatch::Handler`` 接口含 ``DeleteRangeCF`` 虚函数，原实现未覆盖该方法，
+导致含 range delete 的 WAL batch 中 CF ID 校验存在遗漏。补充覆盖后行为与其他操作类型一致。
+
+**5. 删除冗余 ``FlushWAL`` 调用**
+
+Step 5（Flush & verify）中原有 ``raw_db->FlushWAL(true)``，但所有回放写入均设置了
+``disableWAL=true``，RocksDB 不产生 WAL，该调用为空操作，已删除。
+
+涉及文件汇总：
+
+.. list-table::
+   :header-rows: 1
+
+   * - 文件
+     - 改动说明
+   * - ``src/os/bluestore/WalBypassUtil.h``
+     - 新增 ``<fcntl.h>``、``<filesystem>``、``<unistd.h>`` 包含；
+       新增 ``wal_fsync_path()`` / ``wal_fsync_directory()`` inline 函数
+   * - ``src/os/bluestore/WalBypassCapture.cpp``
+     - 删除匿名命名空间内重复的 ``fsync_path()`` / ``fsync_directory()``（约 25 行）；
+       3 处调用更新为 ``wal_fsync_path`` / ``wal_fsync_directory``
+   * - ``src/tools/ceph_bluestore_wal_replay.cc``
+     - 新增 ``compute_max_cf_id()``；删除两处死 ``ListColumnFamilies`` 调用；
+       简化 verify-only 分支；补 ``DeleteRangeCF`` 覆盖；
+       ``write_checkpoint`` 改用 ``wal_fsync_*``；删除冗余 ``FlushWAL``
+
+本轮补充清理（本次对话）
+------------------------
+
+在上述基础上，又做了几项以“调用链收敛、重复逻辑合并”为目标的精简，
+相关改动已通过 ``ninja ceph-bluestore-wal-replay`` 增量构建验证，
+并通过 ``qa/standalone/test-wal-replay.sh`` 回归测试。
+
+**1. 提取并复用原子写文件 helper**
+
+在 ``WalBypassCapture.cpp`` 新增 ``atomic_write_file()``，
+统一 ``tmp write -> fsync -> rename -> fsync(dir)`` 流程。
+``WalBypassSeqState`` 的状态文件持久化与 ``persist_sharding_meta()``
+都改为复用该 helper，消除重复实现。
+
+**2. 引入轻量文件名/序号双向编解码对象**
+
+在 ``WalBypassUtil.h`` 新增 ``wal_bypass_file_t``，提供：
+
+- ``filename()``：由序号生成标准文件名
+- ``from_filename()``：由文件名解析序号
+
+并让原有 ``make_wal_bypass_filename()`` / ``parse_wal_bypass_seq()``
+作为兼容包装调用新对象。``WalBypassCapture.cpp`` 与
+``ceph_bluestore_wal_replay.cc`` 的扫描/生成路径已切换到统一接口。
+
+**3. ``flush_loop`` 分支线性化**
+
+将 worker 线程中的写入路径改为早 ``continue`` 风格，
+减少 ``if/else`` 嵌套层级，逻辑保持不变：
+
+- 无待刷数据时直接更新 backlog 并继续循环
+- 写失败时快速标记失败并继续下一轮
+- 写成功后再执行 rotate 检查
+
+**4. ``WalBypassSeqState`` 内部调用链收敛**
+
+将 ``initialize()`` / ``commit_opened_seq()`` /
+``ensure_consistent_with_disk()`` 中重复的
+“更新 ``next_seq`` + 持久化”逻辑合并为
+``assign_and_persist_next_seq()``。
+
+随后进一步折叠一层调用：将原 ``persist_state_file()``
+并入 ``assign_and_persist_next_seq()``，
+形成单入口原子语义（赋值后立即落盘）。
+
+**5. 其他小幅清理**
+
+- ``read_state_file()`` 解析分支简化为单点检查（``if (!(in >> parsed))``）
+- ``rotate_stream_unlocked()`` 删除冗余 ``old_stream.reset()``
+- ``update_backlog_locked()`` 在 ``m_current_stream == nullptr`` 时显式置 0
+- ``try_create_stream()`` 失败路径去重（合并 ``on_write_error()+return nullptr``）
+
 下一步建议
 ----------
 
