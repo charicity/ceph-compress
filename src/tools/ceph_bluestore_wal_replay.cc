@@ -7,6 +7,7 @@
 // Usage:
 //   ceph-bluestore-wal-replay --wal-dir <dir> --mode posix --db-path <dir>
 //   ceph-bluestore-wal-replay --wal-dir <dir> --mode bluestore --osd-path <dir>
+//   ceph-bluestore-wal-replay --wal-dir <dir> --mode bluestore --osd-path <dir> --recover
 //   ceph-bluestore-wal-replay --wal-dir <dir> --verify-only
 //
 
@@ -64,6 +65,7 @@ struct ReplayOptions {
   uint64_t    checkpoint_interval = 10000;
   uint64_t    stop_seqno = 0;  // 0 = no limit
   bool        verify_only = false;
+  bool        recover = false; // auto mkfs + replay for bluestore
 };
 
 struct Checkpoint {
@@ -340,7 +342,8 @@ static int open_bluestore_db(const ReplayOptions& opt,
                              const std::string& sharding_text,
                              std::unique_ptr<BlueStore>& bluestore,
                              rocksdb::DB*& raw_db,
-                             uint32_t& max_cf_id)
+                             uint32_t& max_cf_id,
+                             KeyValueDB*& kv_out)
 {
   bluestore = std::make_unique<BlueStore>(g_ceph_context, opt.osd_path);
 
@@ -360,11 +363,66 @@ static int open_bluestore_db(const ReplayOptions& opt,
   }
 
   raw_db = rocks_db->get_raw_db();
+  kv_out = db_ptr;
   max_cf_id = compute_max_cf_id(sharding_text);
 
   std::cout << "Opened BlueStore DB at " << opt.osd_path
             << " with max_cf_id=" << max_cf_id << std::endl;
   return 0;
+}
+
+// ============================================================================
+// Recover BlueStore DB — mkfs + open for replay
+// ============================================================================
+
+static int recover_bluestore_db(const ReplayOptions& opt,
+                                const std::string& sharding_text,
+                                std::unique_ptr<BlueStore>& bluestore,
+                                rocksdb::DB*& raw_db,
+                                uint32_t& max_cf_id,
+                                KeyValueDB*& kv_out)
+{
+  // Phase 1: Remove mkfs_done to allow mkfs to re-execute.
+  // BlueStore::mkfs() is idempotent when mkfs_done is absent — it
+  // rebuilds the skeleton DB (BlueFS + empty RocksDB) while reusing the
+  // existing FSID and block device.  The data region on the block device
+  // is NOT overwritten, so object data survives.
+  {
+    fs::path mkfs_done = fs::path(opt.osd_path) / "mkfs_done";
+    std::error_code ec;
+    if (fs::exists(mkfs_done, ec)) {
+      fs::remove(mkfs_done, ec);
+      if (ec) {
+        std::cerr << "ERROR: cannot remove " << mkfs_done
+                  << ": " << ec.message() << std::endl;
+        return -EIO;
+      }
+      std::cout << "Removed mkfs_done to enable re-mkfs" << std::endl;
+    }
+  }
+
+  // Phase 2: Run BlueStore::mkfs() to rebuild skeleton DB.
+  // We create a temporary BlueStore instance solely for mkfs, then
+  // destroy it.  mkfs() internally opens and closes all resources.
+  std::cout << "=== Running BlueStore mkfs on " << opt.osd_path
+            << " ===" << std::endl;
+  {
+    auto mkfs_store = std::make_unique<BlueStore>(g_ceph_context,
+                                                  opt.osd_path);
+    int r = mkfs_store->mkfs();
+    if (r < 0) {
+      std::cerr << "ERROR: BlueStore mkfs failed at " << opt.osd_path
+                << ": " << cpp_strerror(r) << std::endl;
+      return r;
+    }
+    // mkfs_store destructor cleans up all internal state.
+    std::cout << "BlueStore mkfs completed successfully" << std::endl;
+  }
+
+  // Phase 3: Open the freshly-created DB for replay via the standard
+  // open_db_environment path.
+  return open_bluestore_db(opt, sharding_text, bluestore, raw_db, max_cf_id,
+                           kv_out);
 }
 
 // ============================================================================
@@ -528,6 +586,9 @@ Mode (choose one):
   --mode bluestore          Replay to BlueStore's RocksDB (requires prior mkfs)
     --osd-path <dir>        OSD data directory
 
+  --mode bluestore --recover  Auto mkfs + WAL replay (one-step recovery)
+    --osd-path <dir>          OSD data directory (block device must be intact)
+
   --verify-only             Only scan and validate, do not write
 
 Optional:
@@ -567,6 +628,8 @@ static int parse_args(int argc, const char** argv, ReplayOptions& opt)
       opt.checkpoint_interval = strtoull(args[++i], nullptr, 10);
     } else if (a == "--verify-only") {
       opt.verify_only = true;
+    } else if (a == "--recover") {
+      opt.recover = true;
     } else if (a == "-h" || a == "--help") {
       usage();
       return 1;
@@ -592,6 +655,10 @@ static int parse_args(int argc, const char** argv, ReplayOptions& opt)
     }
     if (opt.mode == "bluestore" && opt.osd_path.empty()) {
       std::cerr << "ERROR: --osd-path is required for bluestore mode" << std::endl;
+      return -EINVAL;
+    }
+    if (opt.recover && opt.mode != "bluestore") {
+      std::cerr << "ERROR: --recover requires --mode bluestore" << std::endl;
       return -EINVAL;
     }
   }
@@ -651,6 +718,7 @@ int main(int argc, const char** argv)
 
   // ---- Step 2: Open target DB ----
   rocksdb::DB* raw_db = nullptr;
+  KeyValueDB* kv_db = nullptr;  // non-owning, for post-replay ops
   uint32_t max_cf_id = 0;
   std::unique_ptr<RocksDBStore> posix_store;
   std::unique_ptr<BlueStore> bluestore;
@@ -659,8 +727,13 @@ int main(int argc, const char** argv)
     if (opt.mode == "posix") {
       r = open_posix_db(opt, sharding_text, posix_store, raw_db, max_cf_id);
       if (r < 0) return EXIT_FAILURE;
+    } else if (opt.mode == "bluestore" && opt.recover) {
+      r = recover_bluestore_db(opt, sharding_text, bluestore, raw_db, max_cf_id,
+                               kv_db);
+      if (r < 0) return EXIT_FAILURE;
     } else if (opt.mode == "bluestore") {
-      r = open_bluestore_db(opt, sharding_text, bluestore, raw_db, max_cf_id);
+      r = open_bluestore_db(opt, sharding_text, bluestore, raw_db, max_cf_id,
+                            kv_db);
       if (r < 0) return EXIT_FAILURE;
     }
   } else {
@@ -736,6 +809,53 @@ int main(int argc, const char** argv)
       if (!s.ok()) {
         std::cerr << "WARNING: Flush failed: " << s.ToString() << std::endl;
       }
+    }
+  }
+
+  // ---- Step 5b: Post-replay fixups (recover mode only) ----
+  // After mkfs + WAL replay the bitmap freelist (PREFIX_ALLOC_BITMAP "b")
+  // is inconsistent: mkfs created an empty allocation map, but the replayed
+  // ONode/SharedBlob data references real disk extents.  If we leave the
+  // bitmap freelist in place, OSD mount will hit a BitmapFreelistManager
+  // assert failure.
+  //
+  // By clearing the bitmap entries and setting freelist_type to "null", the
+  // OSD will use NullFreelistManager on next mount.  NullFM reconstructs
+  // allocations automatically from ONode extent metadata
+  // (read_allocation_from_drive_on_startup).
+  //
+  // We also clear PREFIX_DEFERRED ("L") entries.  Deferred transactions
+  // captured in WAL reference temporary block allocations that aren't
+  // tracked in the reconstructed allocator.  Since the underlying block
+  // device was NOT corrupted, deferred writes are already in place on
+  // disk and don't need to be replayed.  Leaving them would cause
+  // _deferred_replay() to release blocks the allocator doesn't own,
+  // triggering an AvlAllocator assert.
+  if (kv_db && opt.recover && r >= 0) {
+    std::cout << "Post-replay fixups ..." << std::endl;
+    KeyValueDB::Transaction t = kv_db->get_transaction();
+
+    // Clear all bitmap freelist entries
+    t->rmkeys_by_prefix("b");  // PREFIX_ALLOC_BITMAP
+
+    // Clear deferred transaction entries
+    t->rmkeys_by_prefix("L");  // PREFIX_DEFERRED
+
+    // Set freelist_type = "null" in PREFIX_SUPER
+    bufferlist bl;
+    bl.append("null");
+    t->set("S", "freelist_type", bl);  // PREFIX_SUPER
+
+    int submit_r = kv_db->submit_transaction_sync(t);
+    if (submit_r < 0) {
+      std::cerr << "ERROR: failed to apply post-replay fixups: "
+                << cpp_strerror(submit_r) << std::endl;
+      r = submit_r;
+    } else {
+      std::cout << "Freelist switched to null (OSD will reconstruct "
+                << "allocations from ONode data on mount)" << std::endl;
+      std::cout << "Deferred transactions cleared (block data intact)"
+                << std::endl;
     }
   }
 
