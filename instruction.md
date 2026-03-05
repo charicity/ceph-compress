@@ -1,641 +1,188 @@
-# Ceph OSD 元数据 WAL 旁路备份与全量回放方案（纯 WAL 精简版）
+# Ceph OSD 元数据 WAL 旁路与回放方案（精简执行版）
 
-## 0. 目标与边界
-
-### 0.1 目标
-- 在不打扰 RocksDB 正常写路径的前提下，将 OSD 元数据 WAL 持续旁路到独立存储介质。
-- 灾难后基于“空骨架 RocksDB + WAL 全量重放”恢复 OSD 元数据状态。
-- 方案优先保证：**写入路径无感**、**回放顺序绝对正确**、**实现复杂度可控**。
-
-### 0.2 非目标
-- 不引入 RocksDB Checkpoint/快照链。
-- 不在本阶段实现增量截断、WAL 归档清理策略自动化（可后续扩展）。
-- 不改变 Ceph 现有 OSD 业务语义与上层协议行为。
+更新时间：2026-03-04
 
 ---
 
-## 1. 核心架构：纯 WAL 旁路 + 全量重放
+## 1. 目标与边界
 
-系统只做两件事：
-1) 无感偷录（Bypass Capture）
-2) 从头回放（Full Replay）
+### 目标
+- 在不干扰 RocksDB 主写路径前提下，持续旁路 OSD 元数据 WAL 到独立介质。
+- 灾后基于“空骨架 RocksDB（mkfs）+ WAL 全量回放”恢复元数据。
+- 优先级：**主写无感 > 顺序正确 > 复杂度可控**。
 
-### 1.1 模块 A：实时拦截与无限轮转（OSD 进程内）
+### 非目标（本期不做，快照阶段实现）
+- 不引入 RocksDB Checkpoint/快照链（→ PR-10 实现）。
+- 不实现自动归档/自动截断策略（→ PR-10 实现 WAL GC）。
+- 不改变 Ceph 现有 OSD 业务语义。
 
-#### 1.1.1 拦截点
-- 在 `BlueRocksWritableFile::Append` 中识别 RocksDB WAL 写入（`.log`）。
-- 仅复制 WAL 字节流，不改写 RocksDB 原始写入逻辑。
-- 原写路径必须保持原有时延特征，旁路逻辑不应引入同步 I/O 阻塞。
-
-#### 1.1.2 双缓冲异步刷盘
-- 使用两个内存缓冲区：`active_buffer`（前台追加）与 `flush_buffer`（后台刷盘）。
-- 典型流程：
-  - 前台线程写入 `active_buffer`。
-  - 达到触发阈值（字节阈值/时间阈值）后做原子交换。
-  - 后台线程消费 `flush_buffer`，顺序写入独立磁盘文件。
-- 约束：
-  - 前台线程只做内存拷贝 + 轻量同步，不等待磁盘完成。
-  - 后台线程串行写，避免文件内顺序错乱。
-  - 进程退出时执行 `drain + flush + fsync + close`。
-
-#### 1.1.3 严格轮转机制（无限增长场景）
-- 轮转触发条件（建议“或”关系）：
-  - 单文件累计写入 >= `1 GiB`；
-  - 文件打开时长 >= `24h`。
-- 文件命名建议：
-  - `ceph_wal_0000000001.log`
-  - `ceph_wal_0000000002.log`
-- 强制要求：
-  - 序号严格单调递增、无回退。
-  - `close old -> fsync metadata -> open new` 顺序可审计。
-  - 轮转窗口内内存数据不丢失，不跨文件乱序。
-
-#### 1.1.4 顺序与完整性元信息
-- 每个旁路文件建议写入文件头（header）：
-  - `magic/version`、`file_seq`、`create_ts`、`start_lsn(可选)`。
-- 文件尾或 sidecar 建议记录：
-  - `bytes_written`、`crc32/xxhash`（可选）、`end_seqno_hint(可选)`。
-- 目的：回放前快速校验、发现断裂、定位损坏区间。
-
-#### 1.1.5 关键失败场景处理
-- 独立盘写慢：
-  - 指标告警（backlog bytes、flush latency、drop count）。
-  - 可配置“背压策略/告警策略”，默认不阻塞主写路径。
-- 独立盘不可写（ENOSPC/EIO）：
-  - 记录高优先级错误日志并打点。
-  - 根据策略选择：继续服务但标记“备份失效窗口”。
-- 进程崩溃：
-  - 接受最后极短窗口未落盘风险；
-  - 通过小批次 flush 与更短触发周期降低窗口。
-
-### 1.2 模块 B：异地复原与全量回放（独立 C++ 工具）
-
-#### 1.2.1 恢复前置
-- 在目标机先运行：`ceph-osd --mkfs`。
-- 目的：生成合法空 RocksDB（正确 `MANIFEST`、CF ID、元数据布局）。
-
-#### 1.2.2 回放主流程
-1. 扫描 WAL 目录，按 `file_seq` 升序排序。
-2. 逐文件读取并解析 RocksDB WAL `WriteBatch`。
-3. 对空库执行 `db->Write(write_opts, &batch)`。
-4. 关键参数：`write_opts.disableWAL = true`。
-
-#### 1.2.3 回放中断续跑（必须）
-- 工具维护恢复检查点（checkpoint），建议每 N 条 batch 或每 M 秒落盘：
-  - `last_file_seq`
-  - `last_file_offset`
-  - `last_applied_seqno`（若可提取）
-- 重启后从检查点继续，避免“3 天回放中断后从头再来”。
-
-#### 1.2.4 回放终止条件（时间旅行能力）
-- 支持可选停止条件：
-  - 截止时间戳 `--stop-ts`
-  - 截止序号 `--stop-seqno`
-- 以实现“恢复到历史某一时刻”的定点复原。
-
-#### 1.2.5 数据一致性校验
-- 回放后至少校验：
-  - RocksDB 可正常打开；
-  - 关键 CF 存在且元数据读路径可工作；
-  - OSD 启动后可加入集群并通过基础健康检查。
+> **注意**：当前 MVP 阶段的代码设计必须为快照阶段预留改造空间，参见第 10 节。
 
 ---
 
-## 2. 纯 WAL 方案权衡（必须提前评估）
+## 2. 核心方案（纯 WAL）
 
-| 评估维度 | 纯 WAL 方案表现 | 应对策略 / 现实考量 |
-|---|---|---|
-| 系统侵入性 | 极低 | 不调用 Checkpoint、不干预 Compaction，主链路改动最小 |
-| 存储空间成本 | 极高（持续增长） | 规划独立低成本大容量存储；建立容量告警与离线归档策略 |
-| 灾难恢复时间（RTO） | 极长（可能天级） | `disableWAL` 加速仅降低部分 I/O；仍受 MemTable flush + SST compaction 物理上限约束 |
-| 数据灵活性 | 高（支持时间旅行） | 借助 stop 条件实现任意历史点回放 |
+### A. 在线旁路（OSD 进程内）
+- 拦截点：`BlueRocksWritableFile::Append`，仅处理 WAL（`.log`）。
+- 前台线程：只做内存追加，不等待独立盘 I/O。
+- 后台线程：串行刷盘，保证单文件内顺序。
+- 双缓冲：`active_buffer` / `flush_buffer`。
+- 轮转：大小阈值或时间阈值触发（默认建议 1GiB 或 24h）。
+- 文件命名：`ceph_wal_<seq>.log`，序号严格递增且持久化。
+- 退出：`drain + flush + fsync + close`。
 
-容量粗算示例：若单 OSD 每日 10GB WAL，1 年约 `3.65TB`（未压缩，不含冗余）。
-
----
-
-## 3. 实施路线图
-
-### Phase 1：旁路与轮转引擎
-- 在 `BlueRocksEnv` / `BlueRocksWritableFile` 植入 WAL 拦截与双缓冲。
-- 实现独立盘写线程与轮转状态机。
-- 验收重点：
-  - 切换窗口无丢失、无乱序；
-  - 序号连续；
-  - OSD 前台写延迟无显著回归。
-
-### Phase 2：压力与稳定性
-- 用 `fio`/`rados bench` 施加高强度随机小写入。
-- 观测项：
-  - OSD RSS 曲线（双缓冲是否泄漏）；
-  - 后台 flush 吞吐是否长期追平 WAL 产生速率；
-  - backlog 是否可控。
-- 故障注入：
-  - 独立盘限速/满盘/短暂断开；
-  - OSD 重启与异常退出。
-
-### Phase 3：全量回放工具
-- 开发独立 C++ 回放程序（scan/sort/parse/apply）。
-- 优先完成：
-  - `disableWAL` 写入模式；
-  - 可恢复 checkpoint；
-  - stop 条件；
-  - 进度与速率统计。
-
-### Phase 4：破坏性复原演练
-- 模拟元数据盘损坏（测试环境）。
-- 执行 `mkfs + replay` 端到端重建。
-- 启动 OSD 并验证：
-  - 守护进程状态正常；
-  - 集群健康与数据路径可用；
-  - 演练报告记录 RTO、失败点、人工介入步骤。
+### B. 离线回放（独立工具）
+- 前置：目标机先 `ceph-osd --mkfs` 生成合法空 DB。
+- 回放：按 `file_seq` 升序扫描 WAL，解析 WriteBatch 后写入 DB。
+- 关键参数：`disableWAL=true`（回放写入不再产生二次 WAL）。
+- 断点续跑：checkpoint 保存 `file_seq/offset/seqno`。
+- 可选终止：`--stop-ts` 或 `--stop-seqno`（时间旅行恢复）。
 
 ---
 
-## 4. 最小可交付（MVP）定义
+## 3. MVP 验收标准
 
 MVP 必须同时满足：
-1. 拦截 `.log` WAL 并持续旁路写入，支持按大小/时间轮转。
-2. 文件序号严格连续，重启后不倒退。
-3. 回放工具可从 0 开始恢复并成功启动 OSD。
-4. 回放工具支持中断续跑。
-5. 在压力测试下，OSD 主写路径无明显阻塞（仅允许可解释的轻微开销）。
+1. `.log` WAL 可持续旁路，支持 size/time 轮转。
+2. 轮转序号连续，重启不回退。
+3. 回放工具可从空骨架 DB 成功恢复并可启动 OSD。
+4. 回放支持中断续跑。
+5. 压测下主写路径无明显阻塞（可解释的轻微开销可接受）。
 
 ---
 
-## 5. 配置与运维建议（首版）
+## 4. 关键配置与观测项
 
-建议增加可配置项（命名示例）：
+### 配置项（已落地）
 - `bluerocks_wal_bypass_enable`
 - `bluerocks_wal_bypass_dir`
 - `bluerocks_wal_rotate_size_mb`
 - `bluerocks_wal_rotate_interval_sec`
 - `bluerocks_wal_flush_trigger_kb`
 - `bluerocks_wal_flush_interval_ms`
+- `bluerocks_wal_max_backlog_mb`（防 OOM，超限触发丢弃）
 
-建议暴露监控指标：
+### 监控项（已落地）
 - `wal_bypass_bytes_total`
 - `wal_bypass_files_total`
-- `wal_bypass_flush_latency_ms`
+- `wal_bypass_flush_latency`
 - `wal_bypass_backlog_bytes`
 - `wal_bypass_write_errors_total`
-- `wal_replay_batches_total`
-- `wal_replay_bytes_total`
-- `wal_replay_progress_file_seq`
+- `wal_bypass_drops_total`
 
 ---
 
-## 6. 风险清单与缓解
+## 5. 风险与策略（当前结论）
 
-- 回放时间不可接受：
-  - 在下一阶段改造中引入快照机制
-- 旁路链路静默失效：
-  - 缓解：强告警 + 健康探针 + 周期性恢复演练。
-
----
-
-## 7. 里程碑验收标准
-
-- M1（旁路引擎）：连续 10 min 压测无崩溃、无内存泄漏、无序号断裂。
-- M2（回放工具）：在测试集可完整回放并通过 OSD 启动与基础健康检查。
-- M3（灾备演练）：完成至少 2 次端到端破坏性恢复，RTO 统计稳定。
+- **RTO 长**：纯 WAL 全量回放可能天级；后续需快照机制降低恢复时长。
+- **容量高**：WAL 持续增长，需独立大容量盘 + 告警 + 离线归档策略。
+- **独立盘异常**：默认不阻塞主写，必须暴露错误与失效窗口。
+- **慢盘积压**：通过 `max_backlog_mb` 控制内存上限，超限丢弃并计数。
 
 ---
 
-## 8. 后续增强（非本期）
+## 6. PR 路线图（状态）
 
-- WAL 文件压缩与去重归档。
-- 回放并行化（按 CF/分片策略，需验证顺序语义）。
-- 与对象级/快照级备份机制融合，缩短超长 RTO。
+### 已完成
+- **PR-1** 配置与开关骨架：完成并验证。
+- **PR-2** 旁路最小链路：完成，`.log` 可持续旁路。
+- **PR-3** 轮转与序号持久化：完成；修复并发崩溃问题。
+- **PR-4** 可观测性：完成；新增 perf 指标并在线验证。
+- **PR-5** 回放工具 MVP：完成（scan/verify/replay/checkpoint/stop）。
 
-
----
-
-## 9. 最小实现任务分解（按 Ceph 代码目录/符号）
-
-### 9.1 PR-1：配置项与开关骨架（不改数据路径）
-
-**目标**：先落地配置开关与参数，不改变数据路径行为。
-
-**改动文件（建议）**：
-- `src/common/options/global.yaml.in`
-- `src/os/bluestore/BlueStore.cc`（`get_tracked_keys()` / `handle_conf_change()`）
-
-**验收标准**：
-- 新增配置项可读可写，OSD 启停无未知键报错。
-
-### 9.2 PR-2：WAL 旁路器内核（双缓冲 + 后台线程）
-
-**目标**：在不阻塞 RocksDB 主写入线程前提下旁路 `.log` 数据。
-
-**改动文件（建议）**：
-- `src/os/bluestore/BlueRocksEnv.h`
-- `src/os/bluestore/BlueRocksEnv.cc`（`BlueRocksWritableFile::Append` 挂载点）
-- `src/os/bluestore/WalBypassCapture.hpp`
-- `src/os/bluestore/WalBypassCapture.cpp`
-
-**验收标准**：
-- 开关关闭时行为与基线一致；开启后旁路目录持续增长。
-
-### 9.3 PR-3：严格轮转与序号持久化
-
-**目标**：实现 size/time 轮转与重启后序号连续。
-
-**改动文件（建议）**：
-- `src/os/bluestore/WalBypassCapture.hpp`
-- `src/os/bluestore/WalBypassCapture.cpp`
-- `src/os/bluestore/BlueRocksEnv.cc`（引用/接入点）
-
-**验收标准**：
-- 高并发与频繁轮转下不丢失、不乱序、不重复序号。
-
-### 9.4 PR-4：监控与告警可观测性
-
-**目标**：暴露旁路链路核心指标。
-
-**改动文件（建议）**：
-- `src/os/bluestore/BlueStore.h`（新增 `l_bluestore_*` 计数项）
-- `src/os/bluestore/BlueStore.cc`（`_init_logger()` 注册与更新）
-
-**验收标准**：
-- `ceph daemon osd.<id> perf dump` 可见新增字段。
-
-### 9.5 PR-5：全量回放工具（MVP）
-
-**目标**：独立工具支持 scan/sort/replay/checkpoint/stop 条件。
-
-**改动文件（建议）**：
-- `src/tools/CMakeLists.txt`
-- `src/tools/ceph_bluestore_wal_replay.cc`（新文件）
-
-**验收标准**：
-- 从空骨架 DB 回放可成功打开；中断可续跑。
-
-### 9.6 PR-6：测试与演练脚本（最小闭环）
-
-**目标**：建立可重复回归与灾备演练流程。
-
-**改动文件（建议）**：
-- `src/test/objectstore/`（新增/扩展单测）
-- `qa/` 或 `src/script/`（演练脚本，可选）
-
-**验收标准**：
-- 单测稳定通过；至少一次端到端 `mkfs + replay + OSD` 演练记录。
-
-### 9.7 PR-7：恢复一致性校验与回放审计
-
-**目标**：让回放结果“可证明正确”，而非仅“看起来可启动”。
-
-**改动文件（建议）**：
-- `src/tools/ceph_bluestore_wal_replay.cc`
-- `src/tools/` 下新增简易审计输出（可同文件实现）
-
-**实现要点**：
-- 回放时输出并持久化统计：处理文件数、batch 数、总字节、最后序号。
-- 增加 `--verify-only`（只扫描与校验，不写 DB）模式。
-- 检测序号断裂/文件缺失并返回非 0 退出码。
-
-**验收标准**：
-- 故意删掉中间 WAL 文件时，工具能明确报错并定位到文件序号。
-- 正常链路回放后，审计结果可重复。
-
-### 9.8 PR-8：运维手册与值班操作流程
-
-**目标**：形成值班可执行 SOP，降低恢复过程中人为错误率。
-
-**改动文件（建议）**：
-- `instruction.md`（本文件）
-- `doc/` 下新增或补充操作文档（如 `doc/rados/operations/`，按仓库规范放置）
-
-**实现要点**：
-- 明确“触发恢复”的判定条件。
-- 给出标准流程：`mkfs -> replay -> 启动 OSD -> 健康检查 -> 回写报告`。
-- 列出常见故障与处理：ENOSPC、回放中断、序号断裂、RTO 超时。
-
-**验收标准**：
-- 新值班同学按文档可独立完成一次演练。
-- 演练报告包含耗时分解与失败重试记录。
+### 待完成
+- **PR-6** 测试与演练脚本闭环：`mkfs + replay + OSD + health`。
+- **PR-7** 回放审计增强：`--verify-only` 深化、断裂定位、审计输出。
+- **PR-8** 运维手册/SOP：值班可执行恢复流程与故障处置。
 
 ---
 
-## 10. 开发顺序与时间估算（建议）
+## 7. 当前实现快照（关键事实）
 
-- 周 1：PR-1 + PR-2
-- 周 2：PR-3 + PR-4
-- 周 3：PR-5 + PR-7
-- 周 4：PR-6 + PR-8
+### 已完成的稳定性修复（审查后）
+- 修复 `flush_loop` 持锁 I/O：改为“锁内取数据、锁外 I/O、锁内更新状态”。
+- 修复 `m_enabled/m_failed` 数据竞争：改为原子变量。
+- 增加积压上限：防独立盘慢导致内存无上限增长。
+- 将旁路器实例提升到 `BlueRocksEnv` 级共享，避免 WAL 轮转频繁建线程。
+- 强化持久化：状态文件与旁路文件落盘路径增加 fsync 保障。
+- 收敛匹配逻辑：WAL 文件识别更严格（数字前缀 + `.log`）。
+
+### 验证摘要
+- `ceph-osd` 增量构建通过（`ninja -j3 ceph-osd`）。
+- 3 OSD 在线短压：集群健康、指标可见、错误计数为 0。
+- 冒烟脚本通过：文件序号连续，state 与最后序号对齐。
+- 回放脚本通过：verify-only、全量回放、断点续跑、序号断裂检测、幂等回放。
 
 ---
 
-## 11. 交付清单（Definition of Done）
+## 8. 关键文件锚点
 
-1. 旁路 WAL 持续写入，轮转序号严格连续。
-2. 独立盘异常时主写路径不阻断，且有明确告警与指标。
-3. 回放工具支持完整重放、checkpoint 续跑与 `--verify-only` 校验。
-4. 至少一次破坏性恢复演练并产出 RTO 报告。
-5. 文档包含配置说明、恢复步骤、审计项与已知限制。
+- 旁路接入：`src/os/bluestore/BlueRocksEnv.cc`
+- 旁路核心：`src/os/bluestore/WalBypassCapture.hpp/.cpp`
+- 观测注册：`src/os/bluestore/BlueStore.h/.cc`
+- 配置定义：`src/common/options/global.yaml.in`
+- 回放工具：`src/tools/ceph_bluestore_wal_replay.cc`
+- 回放共享工具：`src/os/bluestore/WalBypassUtil.h`
 
 ---
 
-## 12. 当前进度摘要（2026-03-03）
+## 9. 文档留档
 
-### 12.1 PR-1 完成状态
-
-已完成 **PR-1：配置项与开关骨架（不改数据路径）**，并通过构建与运行时测试验证。
-
-**已落地内容：**
-- 新增配置项（6 个）：
-  - `bluerocks_wal_bypass_enable`
-  - `bluerocks_wal_bypass_dir`
-  - `bluerocks_wal_rotate_size_mb`
-  - `bluerocks_wal_rotate_interval_sec`
-  - `bluerocks_wal_flush_trigger_kb`
-  - `bluerocks_wal_flush_interval_ms`
-- `BlueStore::get_tracked_keys()` 已接入上述配置键。
-- `BlueStore::handle_conf_change()` 已接入对应变更分支（骨架处理，不改变数据路径语义）。
-
-### 12.2 测试结论（PR-1）
-
-- `ceph-osd --show-config-value` 可读取 6 个新键默认值。
-- 使用临时配置文件覆盖后，可读回覆盖值。
-- 在运行中的 `osd.0` 执行 `ceph config set` 后，
-  `ceph daemon osd.0 config get/config diff` 可确认值已生效。
-- 执行 `ceph config rm` 后可回滚至默认值。
-
-### 12.3 文档留档
-
-- 已新增测试留档文档：`doc/wal/pr1-config-validation.rst`
-  - 记录了测试方法、关键命令、结果与回滚验证。
-
-### 12.4 下一步建议
-
-- 进入 PR-2：在 `BlueRocksEnv` / `BlueRocksWritableFile::Append` 实现 WAL 旁路双缓冲主干，
-  并保持开关关闭时路径零影响。
-
-### 12.5 PR-2 当前进度（2026-03-03）
-
-已完成 PR-2 最小实现与在线验证。
-
-**已落地内容：**
-- 当前实现位于 `src/os/bluestore/WalBypassCapture.cpp`
-  （由 `src/os/bluestore/BlueRocksEnv.cc` 的 `BlueRocksWritableFile::Append` 挂载调用）。
-- 在 `BlueRocksWritableFile::Append` 中实现 `.log` 文件旁路写入。
-- 保持主写路径不变：原 `append_try_flush` 逻辑未改语义。
-- 完成运行验证：旁路目录出现 `.bypass` 文件，压测期间字节持续增长。
-
-**关键设置注意事项（必须遵守）：**
-- 旁路器在 WAL 文件打开时读取开关，先前是“集群已开机后才 set 配置”，旧 WAL writer 不会自动切换。我会重启 OSD 进程（保留 mon 配置）后再跑一次写入验证。
-
-**留档位置：**
+- `doc/wal/pr1-config-validation.rst`
 - `doc/wal/pr2-bypass-validation.rst`
-
-### 12.6 PR-3 当前进度（2026-03-04）
-
-已完成 PR-3 的核心能力与补充稳定性回归。
-
-**已落地内容：**
-- 在 `src/os/bluestore/WalBypassCapture.cpp`
-  （由 `src/os/bluestore/BlueRocksEnv.cc` 引用）完成严格轮转与序号持久化链路验证：
-  - 旁路文件按 `ceph_wal_<seq>.log` 严格递增；
-  - `ceph_wal_seq.state` 与最大文件序号保持 `+1` 一致；
-  - 支持按大小/时间触发轮转（本次重点验证 2 秒时间轮转）。
-- 在 3 OSD 场景下复现并定位一次 `osd.0` 段错误：
-  - 崩溃线程：`bstore_kv_sync`；
-  - 关键栈：`BlueRocksWritableFile::Append` / `WalBypassCapture` 路径；
-  - 根因：`flush_loop()` 对 `m_current_stream` 的写入/轮转与前台追加存在并发竞争。
-- 已完成并发修复：
-  - 调整 `flush_loop()`，确保对 `m_current_stream` 的关键访问在同一把锁下完成，
-    消除 `rotate_stream()` 与前台 `append()` 的生命周期竞争。
-
-**测试结论（PR-3）：**
-- 短压验证通过：序号连续、`state` 对齐、按时轮转可观测。
-- 修复后 3 OSD 长压（600 秒）通过：
-  - `rados bench` 正常结束（exit code 0）；
-  - `osd tree` 保持 `3 up / 3 in`；
-  - `out/osd.0.log/out/osd.1.log/out/osd.2.log` 中 `Segmentation fault` 计数均为 0；
-  - 旁路文件序号持续连续（样例：`1..1269`），`state=1270` 匹配。
-
-**观测备注：**
-- 压测后出现 `BlueFS spillover` 告警，属于容量/布局信号，
-  不等同于 WAL 旁路功能失败，后续需在容量治理中处理。
-
-**留档位置：**
 - `doc/wal/pr3-rotation-validation.rst`
-
-### 12.7 下一步建议（更新）
-
-- 进入 PR-4：补齐可观测性与告警指标（旁路吞吐、积压、错误计数、回放进度）。
-
-### 12.8 PR-4 当前进度（2026-03-04）
-
-已完成 PR-4：监控与告警可观测性。
-
-**已落地内容：**
-- 在 `src/os/bluestore/BlueStore.h` 新增 WAL 旁路相关 perf 项：
-  - `l_bluestore_wal_bypass_bytes_total`
-  - `l_bluestore_wal_bypass_files_total`
-  - `l_bluestore_wal_bypass_flush_latency`
-  - `l_bluestore_wal_bypass_backlog_bytes`
-  - `l_bluestore_wal_bypass_write_errors_total`
-- 在 `src/os/bluestore/BlueStore.cc::_init_logger()` 注册对应字段：
-  - `wal_bypass_bytes_total`
-  - `wal_bypass_files_total`
-  - `wal_bypass_flush_latency`
-  - `wal_bypass_backlog_bytes`
-  - `wal_bypass_write_errors_total`
-- 在 `src/os/bluestore/BlueRocksEnv.{h,cc}` 透传 `BlueStore::logger` 到 `WalBypassCapture`。
-- 在 `src/os/bluestore/WalBypassCapture.{hpp,cpp}` 增加实时打点：
-  - 成功 flush 后累加 bytes；
-  - 新旁路文件打开时累加 files；
-  - flush 写入路径记录 latency；
-  - 前台/后台缓冲变化时更新 backlog；
-  - 写入/轮转失败时累加 errors。
-
-**构建验证：**
-- 增量构建通过：`cd build && ninja -j3 ceph-osd`。
-
-**留档位置：**
 - `doc/wal/pr4-observability-validation.rst`
-
-### 12.9 PR-4 在线验证结果（2026-03-04，3 OSD 短压）
-
-已按 3 OSD 场景完成在线验证（不含长压）。
-
-**执行形态：**
-- 冷启动后以 `MON=1 OSD=3 MGR=1` 拉起集群；
-- 启动时注入 `bluerocks_wal_bypass_*` 配置；
-- `rados bench 12s write -b 4096` 触发 WAL 写入；
-- 分别读取 `osd.0~2` 的 `perf dump` 新增字段。
-
-**关键结果：**
-- 集群状态：`HEALTH_OK`，`3 up / 3 in`；
-- 压测结果：`Bandwidth=3.47814 MB/s`，`IOPS=890`，`Avg Latency=0.0179568 s`；
-- 三个 OSD 上新增指标均可见且行为符合预期：
-  - `wal_bypass_bytes_total` 均约 75MB 并持续增长；
-  - `wal_bypass_files_total` 为 16~17；
-  - `wal_bypass_flush_latency` 有效（`avgcount` 约 1.4 万，`avgtime` 约 `2e-05`）；
-  - `wal_bypass_backlog_bytes=0`（采样点空闲）；
-  - `wal_bypass_write_errors_total=0`；
-- `/tmp/wal_bypass_pr4` 下可见连续命名的 `ceph_wal_*.log` 文件。
-
-**结论：**
-- PR-4 可观测性链路在 3 OSD 在线场景验证通过。
-
-### 12.10 代码审查与缺陷修复（2026-03-04）
-
-对 PR-1 至 PR-4 落地代码进行全量审查，发现并修复了以下问题：
-
-#### P0 级（严重）
-
-1. **`flush_loop` 持锁做磁盘 I/O**
-   - 原实现 `flush_loop()` 整个循环持有 `m_lock`，包括 `write()`、`rotate_stream()`、`drain_old_streams()` 等 I/O 操作。
-   - 直接违反"前台线程只做内存拷贝，不等待磁盘"的核心设计约束。
-   - **修复**：`dequeue_flush` 拿到数据后释放锁→无锁完成磁盘 I/O→加锁更新状态。
-
-2. **`m_enabled`/`m_failed` 无锁访问导致数据竞争**
-   - `append()` 在加锁前读取 `m_enabled`、`m_failed`，而后台线程持锁写入。
-   - 属于 C++ 标准下 undefined behavior。
-   - **修复**：`m_enabled` 和 `m_failed` 改为 `std::atomic<bool>`。
-
-3. **backlog 无上限可导致 OOM**
-   - 如果旁路盘持续慢于 WAL 产生速率，`m_flush_buffer` 会通过 `append()` 无限膨胀。
-   - **修复**：新增配置项 `bluerocks_wal_max_backlog_mb`（默认 256MB）；
-     超限时丢弃数据并累加 `wal_bypass_drops_total` 计数器。
-
-#### P1 级（中等）
-
-4. **每个 WAL 文件独立创建旁路器实例**
-   - 原设计在 `BlueRocksWritableFile` 中 `make_unique<WalBypassCapture>`，
-     RocksDB WAL 轮转时频繁创建/销毁后台线程与序号状态。
-   - **修复**：将 `WalBypassCapture` 提升到 `BlueRocksEnv` 级别，所有 `WritableFile` 共享同一实例。
-
-5. **`persist_state_file` 和旁路文件缺少 fsync**
-   - `rename` 后未 `fsync` 目录，崩溃后目录项可能丢失。
-   - `std::ofstream::flush()` 仅保证数据到 kernel buffer，不保证落盘。
-   - **修复**：新增 POSIX fsync 辅助函数；
-     `persist_state_file` 在 `rename` 后 `fsync` 目录；
-     `WalBypassCaptureStream` 改用 POSIX fd 写入，`sync_and_close()` 调用 `fdatasync` + `fsync` 目录。
-
-6. **配置项标记 `runtime` 但实际无热更新**
-   - 所有 `bluerocks_wal_*` 配置在 WAL 文件打开时一次性读取，运行时修改不生效。
-   - **修复**：移除 `flags: runtime`；`handle_conf_change` 改为输出"需重启 OSD 生效"日志。
-
-#### P2 级（轻微）
-
-7. **`is_wal_file` 仅检查 `.log` 后缀，过于宽泛**
-   - 可能匹配 `OPTIONS-*.log` 等非 WAL 文件。
-   - **修复**：增加数字前缀校验，确保 basename 为纯数字 + `.log`。
-
-8. **`scan_max_bypass_seq` 中 `directory_iterator` 错误处理不完整**
-   - range-for 迭代过程中的错误不会更新 `ec`，可能抛异常。
-   - **修复**：改用 `it.increment(ec)` 显式迭代。
-
-9. **`#define dout_context nullptr` 无实际用途**
-   - 文件中所有日志均使用 `ldout(m_cct, ...)`，未用到 `dout` 宏。
-   - **修复**：移除多余的 `#define dout_context nullptr`。
-
-10. **`fsync_fd` 定义未使用**
-    - 构建产生 `-Wunused-function` 警告。
-    - **修复**：移除该函数。
-
-#### 涉及文件清单
-
-| 文件 | 变更类型 |
-|------|----------|
-| `src/os/bluestore/WalBypassCapture.cpp` | 重写核心：无锁 I/O、atomic 状态、backlog 上限、fd-based 写入、fsync |
-| `src/os/bluestore/WalBypassCapture.hpp` | 无变化 |
-| `src/os/bluestore/BlueRocksEnv.h` | 新增 `m_wal_bypass` 成员、`get_wal_bypass()` 接口 |
-| `src/os/bluestore/BlueRocksEnv.cc` | 修复 `is_wal_file`、共享旁路实例、`WritableFile` 用裸指针 |
-| `src/os/bluestore/BlueStore.h` | 新增 `l_bluestore_wal_bypass_drops_total` 枚举值 |
-| `src/os/bluestore/BlueStore.cc` | 注册 drops 计数器、tracked keys 增加 `bluerocks_wal_max_backlog_mb`、conf change 日志 |
-| `src/common/options/global.yaml.in` | 新增 `bluerocks_wal_max_backlog_mb`、移除所有 `flags: runtime` |
-| `qa/standalone/test-wal-bypass.sh` | 新增端到端冒烟测试脚本 |
-
-#### 新增配置项
-
-- `bluerocks_wal_max_backlog_mb`（uint，默认 256，最小 1）：
-  旁路缓冲积压超过此阈值时丢弃数据，防止 OOM。
-
-#### 新增 perf 计数器
-
-- `wal_bypass_drops_total`：因背压超限而丢弃的数据次数。
-
-#### 构建验证
-
-- `ninja -j3 ceph-osd` 通过，0 warning 0 error。
-
-#### 冒烟测试验证
-
-- 新增脚本 `qa/standalone/test-wal-bypass.sh`，自动执行：
-  1. 关闭旧集群 → 清理 dev/out → 创建旁路目录
-  2. 以 1 OSD 拉起集群（注入旁路配置）
-  3. `rados bench 10s write -b 4096`
-  4. 检查 perf 计数器
-  5. 关闭集群
-  6. 验证旁路文件：数量、序号连续性、state 文件一致性
-- 测试结果（全部 8 项通过）：
-  - 27 个旁路文件，序号 1..27 严格连续；
-  - state 文件值 28 = last_seq + 1；
-  - 74MB 旁路数据，perf 计数器一致；
-  - 0 写入错误，0 数据丢弃。
-
-**留档位置：**
-- `doc/wal/pr4-observability-validation.rst`（附录：审查后加固）
-
-### 12.11 PR-5 当前进度（2026-03-04）
-
-已完成 PR-5：WAL 全量回放工具（MVP）。
-
-**已落地内容：**
-- 新增独立 C++ 工具 `src/tools/ceph_bluestore_wal_replay.cc`（~800 行），
-  支持 scan/validate/open/replay/checkpoint/flush 完整流程。
-- 复用 RocksDB 原有逻辑：`log::Reader`（WAL 解析）、`WriteBatchInternal::SetContents`（batch 重建）、
-  `db->Write(disableWAL=true)`（写入），未重新实现 WAL 格式解析。
-- 新增 `WalBypassUtil.h` 共享头文件，提取文件名工具函数供捕获器与回放工具共用。
-- 在 `WalBypassCapture.cpp` 中新增：
-  - `notify_new_wal()`：WAL 文件轮转时写入 32KB 零填充，确保 `log::Reader` 块对齐。
-  - `persist_sharding_meta()`：将 `bluestore_rocksdb_cfs` 持久化到旁路目录。
-- 在 `BlueRocksEnv.cc` 中新 WAL 文件构造时调用 `notify_new_wal()`。
-- 在 `RocksDBStore.h` 中新增 `get_raw_db()` 公开只读访问器。
-- 新增 `qa/standalone/test-wal-replay.sh` 端到端测试脚本（5 项测试）。
-
-**工具使用方法：**
-
-```bash
-# 构建
-cd build && ninja ceph-bluestore-wal-replay
-
-# 验证模式（只检查不写 DB）
-bin/ceph-bluestore-wal-replay --wal-dir /path/to/bypass --verify-only
-
-# POSIX 全量回放
-bin/ceph-bluestore-wal-replay --wal-dir /path/to/bypass --mode posix --db-path /tmp/recovered_db
-
-# 定点恢复（到指定序号停止）
-bin/ceph-bluestore-wal-replay --wal-dir /path/to/bypass --mode posix --db-path /tmp/recovered_db --stop-seqno 50000
-
-# 断点续跑
-bin/ceph-bluestore-wal-replay --wal-dir /path/to/bypass --mode posix --db-path /tmp/recovered_db --checkpoint-file /tmp/recovered_db/replay.ckpt
-```
-
-**遇到的关键问题与解决方案（摘要）：**
-1. RocksDB 内部头文件需先于 Ceph 头文件包含，且需定义 `ROCKSDB_PLATFORM_POSIX`，否则 `port::` 命名空间和 `CACHE_LINE_SIZE` 宏冲突。
-2. `RocksDBStore::db` 为私有成员，通过新增 `get_raw_db()` 公开访问器解决。
-3. 重复回放已存在的 DB 时需检测 `CURRENT` 文件，调用 `open()` 而非 `create_and_open()`。
-
-**测试验证：**
-- 回归测试（`test-wal-bypass.sh`）：全部 8 项通过，确认旁路捕获不受影响。
-- 回放测试（`test-wal-replay.sh`）：全部 5 项通过：
-  - TEST A：verify-only 模式 — 1103 batches 扫描成功
-  - TEST B：POSIX 全量回放 — 1103 batches 应用，生成 9 个 RocksDB 文件
-  - TEST C：checkpoint 断点续跑 — stop-seqno=100 正确停止，检查点已写入
-  - TEST D：序列号间隙检测 — 正确报错 "sequence gap detected"
-  - TEST E：幂等回放 — 二次回放同一 DB 成功
-
-**留档位置：**
 - `doc/wal/pr5-replay-tool.rst`
 
-### 12.12 下一步建议（更新）
+---
 
-- 进入 PR-6：端到端灾备演练脚本（mkfs + replay + OSD 启动 + 健康检查）。
-- 进入 PR-7：增强回放审计（区分零填充与真实损坏、逐文件统计）。
+## 10. 快照 + 增量 WAL 演进规划
+
+当前为纯 WAL 全量回放方案，RTO 可能达天级。后续必须引入**定期 RocksDB 快照 + 增量 WAL 回放**，将恢复时间从 O(全量 WAL) 降低到 O(最近快照后的增量 WAL)。
+
+### 技术路径
+1. **在线快照**：OSD 运行期间定期触发 RocksDB Checkpoint（硬链接快照），将快照目录持久化到旁路介质。
+2. **快照标记**：快照完成后，在旁路目录写入锚定文件 `ceph_wal_snapshot_<id>.json`，记录 `{snapshot_id, wal_file_seq, rocksdb_seqno, timestamp}`。
+3. **WAL 截断**：快照成功并验证后，安全删除快照点之前的旧 WAL 旁路文件，释放磁盘空间。
+4. **增量回放**：恢复时先拷贝最近快照为目标 DB，再仅回放快照点之后的 WAL 文件。
+
+### 当前实现的前置改造点（快照就绪要求）
+
+| # | 改造项 | 涉及文件 | 说明 |
+|---|--------|----------|------|
+| 1 | 回放工具支持 `--start-seq` | `ceph_bluestore_wal_replay.cc` | 允许跳过已截断的旧 WAL，从指定序号开始回放；`validate_continuity()` 需放松为"从 start-seq 开始连续" |
+| 2 | 回放工具支持 `--snapshot-dir` | `ceph_bluestore_wal_replay.cc` | 指定快照目录作为基础 DB，回放前自动拷贝快照到 db-path |
+| 3 | `WalBypassCapture` 增加快照标记接口 | `WalBypassCapture.hpp/.cpp` | 新增 `record_snapshot_marker()` 方法，在旁路目录落盘快照锚定元数据 |
+| 4 | WAL 截断/GC 机制 | `WalBypassCapture.cpp` / 管理工具 | `WalBypassSeqState` 增加 `truncate_before(seq)` 接口，安全删除过期文件 |
+| 5 | 快照调度策略（配置项） | `global.yaml.in` | 新增 `bluerocks_wal_snapshot_interval_sec` / `bluerocks_wal_snapshot_retain_count` 等配置 |
+
+> **原则**：上述 1-2 项可在当前 PR-6~PR-8 期间顺带完成，不依赖快照机制本身，属于无风险的前瞻性改造。3-5 项在正式快照 PR 中实现。
+
+---
+
+## 11. 下一步（建议执行顺序）
+
+1. **PR-6**：补齐端到端灾备演练脚本与可重复回归入口。
+2. **PR-7**：回放审计增强（逐文件统计、断裂/缺失定位、退出码规范）。
+3. **PR-8**：沉淀值班 SOP（触发条件、标准步骤、故障分流、RTO 记录模板）。
+4. **PR-9**（前置改造）：回放工具增加 `--start-seq` / `--snapshot-dir` 参数，放松 `validate_continuity` 约束。
+5. **PR-10**（快照核心）：实现在线 RocksDB Checkpoint + 快照标记 + WAL 截断。
+6. **PR-11**（增量回放）：回放工具支持"快照 + 增量 WAL"完整恢复流程。
+
+---
+
+## 12. DoD（交付完成定义）
+
+### MVP 阶段（PR-1 ~ PR-8）
+1. WAL 旁路持续可用，序号连续且可审计。
+2. 独立盘异常不阻断主写，且告警/指标明确。
+3. 回放工具支持完整回放、断点续跑、校验模式。
+4. 至少完成一次破坏性恢复演练并产出 RTO 报告。
+5. 文档覆盖配置、恢复流程、审计项与已知限制。
+6. 回放工具接口预留快照扩展点（`--start-seq` 参数已实现）。
+
+### 快照阶段（PR-9 ~ PR-11）
+7. 支持定期 RocksDB Checkpoint 输出到旁路介质。
+8. 快照锚定文件可关联对应 WAL 序号，可用于截断判定。
+9. WAL 截断安全执行，不破坏增量回放连续性。
+10. "快照 + 增量 WAL"端到端恢复演练通过，RTO 降至小时级以内。
