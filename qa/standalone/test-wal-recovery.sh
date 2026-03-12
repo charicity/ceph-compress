@@ -13,6 +13,7 @@
 #   bash ../qa/standalone/test-wal-recovery.sh [NUM_OBJECTS]
 #
 set -e
+set -o pipefail
 
 NUM_OBJECTS=${1:-50}
 BYPASS_BASE="/tmp/wal_recovery_bypass_$$"
@@ -481,6 +482,25 @@ elif [[ "$VERIFIED" -gt 0 ]]; then
   check_fail "Only $VERIFIED / $NUM_OBJECTS objects verified (some data lost)"
 else
   check_fail "No objects could be verified after recovery"
+fi
+
+# 6f. Write one new object after recovery and verify readback
+info "Verifying post-recovery write/read path with an extra object ..."
+EXTRA_OBJ="recovery-extra-obj-$(date +%s)-$$"
+EXTRA_DATA="extra-payload-for-$EXTRA_OBJ-$(date +%s%N)-$$"
+EXTRA_MD5=$(echo -n "$EXTRA_DATA" | md5sum | awk '{print $1}')
+
+if echo -n "$EXTRA_DATA" | ./bin/rados -p testrecovery put "$EXTRA_OBJ" - 2>/dev/null; then
+  EXTRA_READ_MD5=$(get_obj_md5_with_timeout testrecovery "$EXTRA_OBJ" "$READ_TIMEOUT_SEC" || true)
+  if [[ -n "$EXTRA_READ_MD5" && "$EXTRA_READ_MD5" == "$EXTRA_MD5" ]]; then
+    check_pass "Post-recovery write/read check passed for $EXTRA_OBJ"
+  elif [[ -z "$EXTRA_READ_MD5" ]]; then
+    check_fail "Post-recovery read timed out for $EXTRA_OBJ"
+  else
+    check_fail "Post-recovery checksum mismatch for $EXTRA_OBJ"
+  fi
+else
+  check_fail "Post-recovery write failed for $EXTRA_OBJ"
 fi
 
 # =========================================================================
